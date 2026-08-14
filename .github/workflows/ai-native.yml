@@ -1,0 +1,201 @@
+# CI workflow installed by spooner transform Stage 2 (python stack; warn-only
+# quality gates; hard gates: declared-command executability + .ai-native.yml consistency)
+name: ai-native
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pre-commit:
+    name: pre-commit (markdownlint + common checks, warn-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+      - run: pip install pre-commit
+      # local hooks (typecheck/test) need node_modules which this job does not
+      # install; typecheck runs in the declared-commands hard gate, test in
+      # lint-test — skip them here
+      - run: pre-commit run --all-files
+        env:
+          SKIP: typecheck,test,pytest,pip-audit,manifest-consistency
+      # commitlint runs on the commit-msg stage (never run by --all-files);
+      # write the last commit into .git/COMMIT_EDITMSG (what the hook reads);
+      # --commit-msg-filename is required by pre-commit for this hook stage
+      - name: commitlint — last commit (warn-only)
+        run: |
+          git log -1 --format=%B > .git/COMMIT_EDITMSG
+          pre-commit run --hook-stage commit-msg --commit-msg-filename .git/COMMIT_EDITMSG
+
+  lint-test:
+    name: lint + test (warn-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+      - run: pip install -e . || pip install .
+      - name: test
+        run: python3 -m unittest discover -q || [ $? -eq 5 ]
+  format:
+    name: format check (ruff, warn-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff format --check scripts tests
+  security:
+    name: secret scan (gitleaks, warn-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  declared-commands:
+    name: declared lifecycle commands executable (hard gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Run declared build/test commands
+        run: python3 -m unittest discover -q || [ $? -eq 5 ]
+  manifest-consistency:
+    name: .ai-native.yml consistency + template version (hard gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check manifest consistency and template staleness
+        run: |
+          python3 - <<'PY'
+          import sys, os, re
+          # baked at install time; must track the spooner TOOL_VERSION that
+          # shipped this workflow (docs/08 ledger rule: every bump updates it)
+          EXPECTED = "0.12.0"
+
+          def parse_yaml(text):
+              lines = [(len(l) - len(l.lstrip()), l) for l in text.split("\n")]
+              i = 0
+              def parse_block(indent):
+                  nonlocal i
+                  obj = {}
+                  arr = []
+                  is_array = False
+                  while i < len(lines):
+                      ind, raw = lines[i]
+                      trimmed = raw.strip()
+                      if not trimmed or trimmed.startswith("#"):
+                          i += 1
+                          continue
+                      if ind < indent:
+                          break
+                      if ind > indent:
+                          raise ValueError("unexpected indent at " + trimmed)
+                      if trimmed.startswith("- "):
+                          is_array = True
+                          arr.append(scalar(trimmed[2:]))
+                          i += 1
+                          continue
+                      if is_array:
+                          raise ValueError("mixed map/array at " + trimmed)
+                      m = re.match(r"^([^:]+):\s*(.*)$", trimmed)
+                      if not m:
+                          raise ValueError("cannot parse line " + trimmed)
+                      key = m.group(1).strip()
+                      rest = m.group(2).strip()
+                      if rest == "":
+                          i += 1
+                          obj[key] = parse_block(lines[i][0]) if i < len(lines) and lines[i][0] > ind else None
+                      else:
+                          obj[key] = scalar(rest)
+                          i += 1
+                  return arr if is_array else obj
+              def scalar(raw):
+                  v = raw.strip()
+                  if v == "true":
+                      return True
+                  if v == "false":
+                      return False
+                  if v == "null" or v == "~":
+                      return None
+                  q = re.match(r"^\"([^\"]*)\"$", v)
+                  if q:
+                      return q.group(1)
+                  return float(v) if re.match(r"^-?\d+(\.\d+)?$", v) else v
+              return parse_block(0)
+
+          def _int(s):
+              try:
+                  return int(s)
+              except ValueError:
+                  return None
+
+          def lt(a, b):
+              pa = [_int(p) for p in a.split(".")]
+              pb = [_int(p) for p in b.split(".")]
+              for k in range(max(len(pa), len(pb))):
+                  x = pa[k] if k < len(pa) else 0
+                  y = pb[k] if k < len(pb) else 0
+                  if x is None or y is None:
+                      return a < b
+                  if x != y:
+                      return x < y
+              return False
+
+          def stage_hint(missing):
+              if any(f.startswith("docs/sdd") or f.endswith("sdd.yml") for f in missing):
+                  return 4
+              if any(f == "AGENTS.md" or f == "CLAUDE.md" for f in missing):
+                  return 3
+              return 2
+
+          if not os.path.exists(".ai-native.yml"):
+              print("ai-native: no .ai-native.yml manifest — run transform stage 2 first", file=sys.stderr)
+              sys.exit(1)
+          try:
+              with open(".ai-native.yml", "r", encoding="utf-8") as fh:
+                  m = parse_yaml(fh.read())
+          except Exception as e:
+              print("ai-native: manifest parse error — " + str(e), file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(m, dict) or m.get("schemaVersion") != 1 or m.get("tool") != "spooner" or not isinstance(m.get("stages"), dict):
+              print("ai-native: manifest schema mismatch (expected schemaVersion 1, tool spooner, stages map)", file=sys.stderr)
+              sys.exit(1)
+          missing = []
+          for s in m["stages"].values():
+              if isinstance(s, dict) and isinstance(s.get("files"), list):
+                  for f in s["files"]:
+                      if isinstance(f, str) and not os.path.exists(f):
+                          missing.append(f)
+          if missing:
+              print("ai-native: manifest drift — missing: " + ", ".join(missing) + " — re-run transform stage " + str(stage_hint(missing)), file=sys.stderr)
+              sys.exit(1)
+          version = m.get("version")
+          version = version if isinstance(version, str) else "0.0.0"
+          if lt(version, EXPECTED):
+              print("ai-native: installed templates v" + version + " < expected v" + EXPECTED + " — run sync to apply the current templates", file=sys.stderr)
+              sys.exit(1)
+          print("ai-native: consistent (" + str(len(m["stages"])) + " stage(s) at v" + version + ")")
+          PY

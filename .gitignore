@@ -1,0 +1,22 @@
+# 样本 PDF（敏感文件：未上市公司招股书，勿提交）
+samples/*.pdf
+
+# 字体产物（Apple/微软版权字体提取，勿提交，由 prepare_fonts.py 生成）
+*.ttf
+*.otf
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# 运行时产物
+/tmp/
+orig_fonts/
+
+# spooner check 基线账本（本地记录，不入库；.ai-native.yml 清单入库）
+.ai-native/

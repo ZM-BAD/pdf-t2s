@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-t2s"
+version = "0.1.0"
+description = "Convert Traditional Chinese PDFs to Simplified Chinese while preserving layout (Claude Code skill)"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf",
+    "opencc",
+    "fonttools",
+]
+
+# 本仓库是 skill 分发包，不发布 Python 包；显式声明空包避免
+# setuptools 自动发现到 scripts/ 导致构建歧义。
+[tool.setuptools]
+packages = []

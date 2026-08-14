@@ -1,0 +1,16 @@
+# markdownlint-cli2 config (installed by spooner transform Stage 2)
+config:
+  MD013: false # line length: no limit for Chinese text/tables
+  MD024: false # duplicate headings: bilingual docs mirror sections
+  MD033: false # inline HTML: allow badges
+  MD036: false # emphasis-as-heading: common in Chinese docs (e.g. "借人")
+  MD041: false # first line H1: allow intro quote before heading
+  MD060: false # compact tables: repo style (|col|col|), not enforcing gfm spacing
+globs:
+  - "**/*.md"
+ignores:
+  - node_modules/
+  - .git/
+  # 历史交接文档：1-22 条全局编号跨小节延续，与 MD029 连续编号规则冲突
+  # （重排会破坏编号语义）；如需恢复检查可删除此行后修复文档
+  - handoff.md
