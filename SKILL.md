@@ -20,7 +20,7 @@ description: Use when the user wants to convert a Traditional Chinese (繁體中
 
 **适用**: 文字版 PDF（有文本层）——招股书、年报、合同、法律文件等；敏感文件不想上传云端时；需要保留原始排版时。
 
-**不适用 / 先说明**: 扫描版 PDF（无文本层）→ 必须告知用户需要 OCR 方案（ocrmypdf/tesseract chi_tra→chi_sim、MinerU），**不硬转**（转换结果是空白页）。
+**不适用 / 直接拒绝**: 扫描版 PDF（无文本层）→ 项目**明确放弃扫描版支持、无 OCR 方案/计划**，直接告知用户不支持并停止，**不硬转**（转换结果是空白页）。
 
 ## 仓库结构
 
@@ -59,9 +59,10 @@ python3 -m venv .venv
 5. 全部 span（**含竖排**）加 redact 注释并应用：`apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)`——显式保留图片和矢量线。
 6. 逐行重绘：每视觉行一个 `fitz.Shape(page)`，行内 span 按 x0 排序逐个 `shape.insert_text(...)`，然后 **`shape.commit()`（必须每行 commit，产生独立内容流 → 提取顺序 = 视觉行序）**。
 7. 竖排 span：对 chars **逐字符**转换并按其 origin 重绘，保持竖排排列。
-8. 字体选择（防缺字形/撞名）:
-   - span 文本有变化（含繁体）或含 CJK → 系统简体字体（资源名 `ZS0/ZS1`/`ZR0/ZR1`/`ZT0/ZT1`，见下节字体映射）。
-   - span 无变化且原字体可提取 → 原 PDF 内嵌字体（`doc.extract_font(xref)[3]` 写临时文件，资源名 `ZO<idx>`）。
+8. 字体选择（防缺字形/撞名，规范见 spec/spec.md）:
+   - span 文本有变化（含繁体）→ 系统简体字体（资源名 `ZS0/ZS1`/`ZR0/ZR1`/`ZT0/ZT1`，见下节字体映射）。
+   - span 无变化 → 原 PDF 内嵌字体（`doc.extract_font(xref)[3]` 写临时文件，资源名 `ZO<idx>`）。匹配键为**去 subset 前缀后的 PS 名**（`SPNAJD+MHeiHK-Bold` ≡ `MHeiHK-Bold`），且**复用前逐字符 `has_glyph` 探测映射可用性**——CID CFF 等无 Unicode cmap 的字体（SourceHanSans/MSungHK）`insert_text` 无法映射，回退系统字体；TrueType 字体（TimesLTStd 等）正常复用。
+   - 原字体不可提取或不可映射 → 纯拉丁用 Times、含 CJK 用系统字体。
 9. 宽度收缩防溢出：`font.text_length(new, fontsize=size) > bbox.width*1.02` 时 `size = max(size * bbox.width / fit_w, size * 0.6)`。
 10. 保存：`doc.save(out, garbage=3, deflate=True)`——绝不 `subset_fonts()`（文件约 60MB 是预期代价）。
 
@@ -74,7 +75,7 @@ python3 -m venv .venv
 | MHei / Hei / Sans / Gothic（黑体类） | Hiragino Sans GB W3/W6 | ZS0/ZS1 | t2s-sans-regular/bold.ttf |
 | 其余（MSung / Song / Serif 等宋体类） | Songti SC Regular/Bold | ZR0/ZR1 | t2s-serif-regular/bold.ttf |
 | Times（纯拉丁且无 CJK） | Times New Roman | ZT0/ZT1 | t2s-times(-bold).ttf |
-| 原 PDF 内嵌字体（未转换 span） | 原字体 buffer | ZO\<idx\> | /tmp/pdf-t2s-origfonts/f\<idx\>.\<ext\> |
+| 原 PDF 内嵌字体（未转换 span） | 原字体 buffer（PS 名去 subset 前缀匹配） | ZO\<idx\> | /tmp/pdf-t2s-origfonts/f\<idx\>.\<ext\> |
 
 - 系统字体由 fontTools 从 ttc 提取 face 为独立 ttf，**PS 名（name[6]）加 `ZT2S-` 前缀**防与 PDF 原字体撞名。
 - `Shape.insert_text` 的 `fontfile` 只接受**文件路径**（不接受 buffer）——原字体 buffer 必须写临时文件。
@@ -108,12 +109,16 @@ python3 -m venv .venv
 
 ## 验证门槛（必须跑 verify.py，不验证不算完成）
 
-`scripts/verify.py` 对原始/输出逐页做三级验证:
+`scripts/verify.py` 对原始/输出逐页做五维验证（规范见 spec/spec.md）:
 
-1. **内容级（最重要）**：norm 后字符 multiset（Counter）对比——查丢字/漏转。norm：去全部空白 + 已知变体归一化（`\xad`→"-"、`・`→"•"、U+00A0→" "）。允许差异：於/于（补丁）、标点变体、原 PDF 固有乱码（坑 20）。
-2. **顺序级（参考）**：SequenceMatcher ratio——表格头/竖排页与原始流顺序不同是预期的。
-3. **像素级**：1.0x 渲染暗像素密度对比（抽样 20 页，阈值 0.02）——查 redaction 黑块、字体失效。
-4. **繁体残留**：仅简繁字形不同的特征字串（TRAD）计数。
+1. **内容级（最重要）**：norm 后字符 multiset（Counter）对比——查丢字/漏转。差异按白名单分类（於/于 补丁、标点变体、原始固有乱码），**非白名单差异必须为 0**。
+2. **顺序级（参考）**：SequenceMatcher ratio——输出为视觉阅读序，与原始内容流序不同是预期。
+3. **字体保真**：未转换 span 逐 span 核对输出字体 = 原字体（去前缀 PS 名）——原字体可提取的复用率必须 ≥ 99%；回退与收缩计数写入报告。
+4. **像素级**：1.0x 渲染暗像素密度对比（均匀抽样 + 全部竖排页 + 收缩页，阈值 0.02）。
+5. **竖排**：竖排列字符位置逐点核对——0 缺失。
+6. **繁体残留**：仅简繁字形不同的特征字串（TRAD）计数，必须为 0。
+
+验收判定由 verify.py 末尾输出（✅/❌）。
 
 验收基准（真实样例，可复现对比）:
 
@@ -123,7 +128,8 @@ python3 -m venv .venv
 ## 已知限制
 
 - **标点 unicode 变体**：`-`→软连字符、`•`→`・`、`…`→`⋯`（字体 ToUnicode 一对多映射，页面显示一样，复制得到变体字符，无法根治）。
-- **字体风格**：原始细宋体替换为标准宋体，笔画略粗（墨迹可增 30%~135%，可接受）。
+- **字体风格**：转换过的 span 及原字体不可映射的 span（CID CFF 无 Unicode cmap）存在字形替换（原始细宋体→标准宋体，笔画略粗，墨迹可增 30%~135%）；未转换 span 复用原字体（TrueType 类），无此问题。
+- **横向拉伸丢失**：原始约 2% 的 span 使用非等比横向拉伸（text matrix 1.28× 等，常见于页眉），`insert_text` 不支持非等比缩放，重绘后字距归为正常 em（该行文字变窄约 20%，位置不漂移）。
 - **提取顺序**：个别竖排/表格密集页与原始内容流顺序不同（重建后更符合阅读顺序）。
 - **文件体积**：不子集化导致输出约 60MB（原始 ~8MB），完整字体嵌入所致。
 

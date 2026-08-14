@@ -20,7 +20,14 @@ Repository: pdf-t2s — see README.md for human-facing docs.
 | `make test` | Makefile target |
 | `make convert` | Makefile target |
 | `make verify` | Makefile target |
+| `make lint` | Makefile target (ruff check) |
+| `make format` | Makefile target (ruff format) |
 | `python3 -m unittest discover` | test |
+
+## Scope
+
+- **支持**: 文字版 PDF（有文本层）的繁→简转换——排版/字形保真、竖排支持、本地处理，详见 README.md。
+- **明确放弃**: 扫描版 PDF（无文本层）——**不做 OCR，无 OCR 方案/计划**；输入为扫描版时直接拒绝并告知用户，不转换。
 
 ## Conventions
 
@@ -29,6 +36,6 @@ Repository: pdf-t2s — see README.md for human-facing docs.
 
 ## Spec-driven workflow (SDD)
 
-- Every feature starts as a spec: `docs/sdd/spec.md` (proposed → approved → in-progress → shipped)
-- Implement in independently verifiable slices (docs/sdd/plan.md), tracked in docs/sdd/tasks.md
+- Every feature starts as a spec: `spec/spec.md` (proposed → approved → in-progress → shipped)
+- Implement in independently verifiable slices (spec/plan.md), tracked in spec/tasks.md
 - The sdd CI gate fails when spec files are missing — specs are first-class

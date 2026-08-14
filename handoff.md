@@ -187,7 +187,8 @@
 3. **TDD 流程**（writing-skills 规范要求）：先跑基线压力场景（subagent 无 skill 时大概率选"在线工具"或"提取重排"）→ 写 skill → 验证 agent 按流程走完并跑验证。
 4. **git 提交规范**：conventional commits（feat/fix/docs/refactor），提交信息末尾加 `Co-Authored-By: Claude <noreply@anthropic.com>`。
 5. 验收测试素材：上述两份 PDF 在 /Users/zm_bad/Downloads（敏感文件，**勿提交 git**）。
-6. 若需支持扫描版 PDF：另议 OCR 方案（ocrmypdf/tesseract chi_tra→chi_sim 或 MinerU），不在本 skill v1 范围。
+6. **扫描版 PDF 已明确放弃**（2026-08-16 决策）：无文本层输入不转换、无 OCR 方案/计划，README/AGENTS/SKILL.md 均注明直接拒绝。
+7. **输出体积优化（待办）**：针对转换后体积暴增（约 60MB，完整字体嵌入所致，见第 7 节第 5 条）的问题，后续将考虑转换后字体大小的压缩与优化（如安全子集化、字体流压缩等）——注意需先解决 `subset_fonts` 的 ToUnicode bug（踩坑 16）或验证替代子集化方案不破坏提取映射，属 v1 之后的工作。
 
 ## 11. 参考资料
 

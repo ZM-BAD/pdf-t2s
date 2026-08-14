@@ -22,8 +22,8 @@ stages:
     date: "2026-08-14"
     templateVersion: "0.12.0"
     files:
-      - "docs/sdd/spec.md"
-      - "docs/sdd/plan.md"
-      - "docs/sdd/tasks.md"
+      - "spec/spec.md"
+      - "spec/plan.md"
+      - "spec/tasks.md"
       - ".github/workflows/sdd.yml"
       - "AGENTS.md"

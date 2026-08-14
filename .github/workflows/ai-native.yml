@@ -165,7 +165,7 @@ jobs:
               return False
 
           def stage_hint(missing):
-              if any(f.startswith("docs/sdd") or f.endswith("sdd.yml") for f in missing):
+              if any(f.startswith("spec/") or f.endswith("sdd.yml") for f in missing):
                   return 4
               if any(f == "AGENTS.md" or f == "CLAUDE.md" for f in missing):
                   return 3

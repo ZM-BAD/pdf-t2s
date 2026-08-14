@@ -13,7 +13,20 @@ dependencies = [
     "fonttools",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ruff==0.16.3",
+    "pytest==9.1.1",
+    "pre-commit==4.6.2",
+]
+
 # 本仓库是 skill 分发包，不发布 Python 包；显式声明空包避免
 # setuptools 自动发现到 scripts/ 导致构建歧义。
 [tool.setuptools]
 packages = []
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

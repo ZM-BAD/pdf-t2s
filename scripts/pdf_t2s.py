@@ -109,26 +109,89 @@ def collect_rows(page):
     return rows
 
 
+def font_key(name):
+    """字体名归一：去除 subset 前缀（SPNAJD+MHeiHK-Bold → MHeiHK-Bold）。
+    get_fonts(full=True) 的 basefont 带前缀，rawdict span 字体名不带，
+    统一去前缀后匹配。"""
+    return name.split("+")[-1]
+
+
+_glyph_cache = {}
+
+
+def can_map(font, ch):
+    """该字体能否映射此字符。CID CFF 等无 Unicode cmap 的字体返回 False
+    （insert_text 无法为其做 Unicode→字形映射，复用会导致 notdef/\x00）。
+    结果按 (font, 字符) 缓存。"""
+    key = (id(font), ord(ch))
+    if key not in _glyph_cache:
+        _glyph_cache[key] = font.has_glyph(ord(ch))
+    return _glyph_cache[key]
+
+
 def load_doc_fonts(doc):
-    """提取文档全部内嵌字体: basefont(PostScript名) -> (fitz.Font, 临时文件路径)"""
+    """提取文档全部内嵌字体: {pno: {去前缀PS名: (fitz.Font, 临时文件路径, ZO资源名, 原始xref)}}
+    按页匹配该页实际引用的子集字体——同 PS 名不同子集（不同前缀）时以页为准，
+    保证未转换 span 的字形在该子集中必然存在。ZO 资源名按文档内顺序分配，
+    确定性且无碰撞。"""
     os.makedirs(ORIG_FONT_DIR, exist_ok=True)
-    fonts = {}
+    xref_cache = {}
+    page_fonts = {}
     idx = 0
     for pno in range(len(doc)):
+        pf = {}
         for row in doc[pno].get_fonts(full=True):
             xref, ext, _, basefont, _, _, _ = row
-            if basefont in fonts:
-                continue
-            try:
-                buf = doc.extract_font(xref)[3]
-                path = os.path.join(ORIG_FONT_DIR, f"f{idx}.{ext or 'bin'}")
-                with open(path, "wb") as fh:
-                    fh.write(buf)
-                fonts[basefont] = (fitz.Font(fontbuffer=buf), path)
-                idx += 1
-            except Exception:  # noqa: BLE001, S110 — 单个损坏字体不中断整文档转换
-                pass
-    return fonts
+            key = font_key(basefont)
+            if xref not in xref_cache:
+                try:
+                    buf = doc.extract_font(xref)[3]
+                    if not buf:
+                        continue  # 非嵌入字体（base-14 等）无 buffer，走回退
+                    path = os.path.join(ORIG_FONT_DIR, f"f{idx}.{ext or 'bin'}")
+                    with open(path, "wb") as fh:
+                        fh.write(buf)
+                    xref_cache[xref] = (fitz.Font(fontbuffer=buf), path, f"ZO{idx}")
+                    idx += 1
+                except Exception:  # noqa: BLE001, S112 — 单个损坏字体不中断整文档转换
+                    continue
+            if key not in pf:
+                pf[key] = (*xref_cache[xref], xref)  # (font, path, zo, 该页原始xref)
+        page_fonts[pno] = pf
+    return page_fonts
+
+
+def original_font(fname, doc_fonts):
+    """原字体 -> (资源名, 文件路径)"""
+    return doc_fonts[font_key(fname)][2], doc_fonts[font_key(fname)][1]
+
+
+def fallback_font(fonts, fname, bold, new, has_cjk):
+    """系统字体回退: 返回 (资源名, 文件路径, 字体对象)，选择第一个能映射
+    `new` 全部字符的字体（无命中用首选）。原字体不可提取/不可映射的
+    未转换 span，以及转换过的 span，都经此选择——保证字形可渲染、提取不丢。"""
+    kind = font_kind(fname)
+    cands = []
+    if has_cjk:
+        cands.append(("S" if kind == "sans" else "R", kind))
+        other = "sans" if kind == "serif" else "serif"
+        cands.append(("S" if other == "sans" else "R", other))
+    else:
+        if "Times" in fname:
+            cands.append(("T", "latin"))
+        cands.append(("S", "sans"))
+        cands.append(("R", "serif"))
+    for tag, k2 in cands:
+        if k2 == "latin":
+            fp, fobj = LATIN_SERIF[bold], fonts[("latin_serif", bold)]
+        else:
+            fp, fobj = CJK_FONTS[(k2, bold)], fonts[("cjk", k2, bold)]
+        if all(can_map(fobj, c) for c in new):
+            return f"Z{tag}{bold}", fp, fobj
+    tag, k2 = cands[0]
+    if k2 == "latin":
+        return f"Z{tag}{bold}", LATIN_SERIF[bold], fonts[("latin_serif", bold)]
+    return f"Z{tag}{bold}", CJK_FONTS[(k2, bold)], fonts[("cjk", k2, bold)]
 
 
 def sys_font(fonts, fname, bold):
@@ -171,11 +234,15 @@ def rebuild_page(page, cc, fonts, doc_fonts):
                     ch_new = cc.convert(ch).replace("於", "于")
                     if ch_new != ch:
                         changed += 1
-                        rn, fp = sys_font(fonts, fname, bold)
-                    elif fname in doc_fonts:
-                        rn, fp = f"ZO{abs(hash(fname)) % 9000}", doc_fonts[fname][1]
+                        rn, fp, _ = fallback_font(
+                            fonts, fname, bold, ch_new, is_cjk(ch_new)
+                        )
+                    elif font_key(fname) in doc_fonts and can_map(
+                        doc_fonts[font_key(fname)][0], ch
+                    ):
+                        rn, fp = original_font(fname, doc_fonts)
                     else:
-                        rn, fp = sys_font(fonts, fname, bold)
+                        rn, fp, _ = fallback_font(fonts, fname, bold, ch, is_cjk(ch))
                     shape.insert_text(
                         ch_origin,
                         ch_new,
@@ -186,19 +253,20 @@ def rebuild_page(page, cc, fonts, doc_fonts):
                     )
             else:
                 has_cjk = any(is_cjk(c) for c in new)
-                if new != text or has_cjk:
-                    rn, fp = (
-                        sys_font(fonts, fname, bold)
-                        if has_cjk
-                        else latin_font(fonts, fname, bold)
-                    )
-                elif fname in doc_fonts:
-                    rn, fp = f"ZO{abs(hash(fname)) % 9000}", doc_fonts[fname][1]
+                if new != text:
+                    # 转换过的 span: 需要简体字形 → 系统字体
+                    rn, fp, meas = fallback_font(fonts, fname, bold, new, has_cjk)
+                elif font_key(fname) in doc_fonts and all(
+                    can_map(doc_fonts[font_key(fname)][0], c) for c in new
+                ):
+                    # 未转换 span: 复用原 PDF 内嵌字体（字形 100% 还原）
+                    rn, fp = original_font(fname, doc_fonts)
+                    meas = doc_fonts[font_key(fname)][0]
                 else:
-                    rn, fp = sys_font(fonts, fname, bold)
-                # 简体字通常更窄；若比原矩形宽，等比缩小字号防溢出
-                font = fonts[("cjk", font_kind(fname), bold)]
-                fit_w = font.text_length(new, fontsize=size)
+                    # 未转换 span 且原字体不可提取/不可映射 → 系统字体回退
+                    rn, fp, meas = fallback_font(fonts, fname, bold, new, has_cjk)
+                # 宽度收缩: 以实际绘制字体度量（未转换 span 用原字体度量一致，不触发）
+                fit_w = meas.text_length(new, fontsize=size)
                 if fit_w > bbox.width * 1.02 and fit_w > 0:
                     size = max(size * bbox.width / fit_w, size * 0.6)
                 shape.insert_text(
@@ -219,10 +287,11 @@ def process_pdf(src, cc, fonts, out=None):
     n = len(doc)
     print("  提取内嵌字体…", flush=True)
     doc_fonts = load_doc_fonts(doc)
-    print(f"  可用原字体 {len(doc_fonts)} 个", flush=True)
+    n_fonts = len({f for pf in doc_fonts.values() for f in pf})
+    print(f"  可用原字体 {n_fonts} 个", flush=True)
     total_changed = changed_pages = 0
     for pno in range(n):
-        changed = rebuild_page(doc[pno], cc, fonts, doc_fonts)
+        changed = rebuild_page(doc[pno], cc, fonts, doc_fonts[pno])
         if changed:
             changed_pages += 1
             total_changed += changed

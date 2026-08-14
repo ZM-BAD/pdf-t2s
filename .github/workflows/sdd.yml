@@ -17,5 +17,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Check docs/sdd/spec.md exists
-        run: test -f docs/sdd/spec.md
+      - name: Check spec/spec.md exists
+        run: test -f spec/spec.md

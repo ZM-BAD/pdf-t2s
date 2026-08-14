@@ -11,6 +11,8 @@ globs:
 ignores:
   - node_modules/
   - .git/
+  - .venv/
+  - venv/
   # 历史交接文档：1-22 条全局编号跨小节延续，与 MD029 连续编号规则冲突
   # （重排会破坏编号语义）；如需恢复检查可删除此行后修复文档
   - handoff.md

@@ -1,0 +1,39 @@
+# Quality gates (hard): UT + lint + format.
+# 依赖与版本声明: pyproject.toml (dev extra) / uv.lock 为准，此处锁定一致。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint + format (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+      - run: pip install ruff==0.16.3
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format (check only)
+        run: ruff format --check .
+
+  test:
+    name: unit tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements.txt pytest==9.1.1
+      - name: pytest
+        run: python -m pytest -q
