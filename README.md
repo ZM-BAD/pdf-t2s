@@ -75,7 +75,7 @@ pre-commit 与 CI 均包含 UT、lint、formatter 三关；CI 硬门槛见 `.git
 
 ## 已知限制
 
-- 输出文件约 60MB（不子集化，完整字体嵌入——子集化会破坏文本提取映射）。
+- 输出体积约 12-18MB（v1.1 起用 fontTools 预子集化系统字体；原 PDF 内嵌字体 ZO 完整嵌入以保证字形保真——`doc.subset_fonts()` 有 ToUnicode bug 不可用，预子集化绕开该路径）。
 - 个别标点复制时得到 unicode 变体（页面显示完全一样）。
 - 原始细宋体替换为标准宋体，笔画略粗。
 

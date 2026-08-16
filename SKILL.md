@@ -64,7 +64,8 @@ python3 -m venv .venv
    - span 无变化 → 原 PDF 内嵌字体（`doc.extract_font(xref)[3]` 写临时文件，资源名 `ZO<idx>`）。匹配键为**去 subset 前缀后的 PS 名**（`SPNAJD+MHeiHK-Bold` ≡ `MHeiHK-Bold`），且**复用前逐字符 `has_glyph` 探测映射可用性**——CID CFF 等无 Unicode cmap 的字体（SourceHanSans/MSungHK）`insert_text` 无法映射，回退系统字体；TrueType 字体（TimesLTStd 等）正常复用。
    - 原字体不可提取或不可映射 → 纯拉丁用 Times、含 CJK 用系统字体。
 9. 宽度收缩防溢出：`font.text_length(new, fontsize=size) > bbox.width*1.02` 时 `size = max(size * bbox.width / fit_w, size * 0.6)`。
-10. 保存：`doc.save(out, garbage=3, deflate=True)`——绝不 `subset_fonts()`（文件约 60MB 是预期代价）。
+10. 字体子集化（v1.1 体积优化）：重绘前全文档收集每个系统字体实际用到的字符集（`collect_needed_chars`，与重绘共用 `pick_font`），fontTools 预子集化（`subset_system_fonts`，仅系统字体，失败回退完整字体），经 `font_path_map` 替换 fontfile。**绕开 `doc.subset_fonts()` 的 ToUnicode bug**——MuPDF 嵌入的已是合法子集，ToUnicode 由 cmap 正常生成（实验验证：20.9MB serif → 9KB，提取无乱码）。原 PDF 内嵌字体（ZO）已是子集，不子集化。
+11. 保存：`doc.save(out, garbage=3, deflate=True)`——绝不 `doc.subset_fonts()`。输出体积约 12-18MB（v1.0 为 ~60MB）。
 
 输出文件命名：`原名_简体.pdf`（与输入同目录）。
 
@@ -99,13 +100,15 @@ python3 -m venv .venv
 | 13 | 竖排检测陷阱 | 竖排 `dir=(0,±1)` 但 **wmode==0**；不识别会横排重绘成蚂蚁字 |
 | 14 | 竖排必须 redact | 竖排 bbox 与多个横排 redact 重叠，不 redact 会被误切丢字 |
 | 15 | "於"不转换 | OpenCC 不转独立"於"→ 必须补丁 `replace("於","于")` |
-| 16 | subset_fonts bug | ToUnicode 映射错误 → "财务资料"提取成控制字符；禁用（文件 35→62MB 值得） |
+| 16 | subset_fonts bug | ToUnicode 映射错误 → "财务资料"提取成控制字符；禁用。v1.1 用 fontTools **预子集化**绕开（嵌入前子集化，MuPDF 只嵌入合法子集，ToUnicode 正常），体积 60→12-18MB |
 | 17 | 0.5x 渲染失效 | 细字抗锯齿后密度检测几乎全 0 → 像素级验证必须 1.0x |
 | 18 | TextWriter 撞名 bug | 按 PS 名复用文档字体 → 系统宋体与智谱原字体撞名 → 子集字体缺字形乱码；双重修复：Shape 自定义资源名 + PS 名 ZT2S- 前缀 |
 | 19 | fontfile 只收路径 | 原字体 buffer 需写临时文件（fitz.Font 可收 buffer 用于测量） |
 | 20 | 原 PDF 固有乱码 | 个别字体 ToUnicode 本身错误（安永信头页）→ 视觉还原、提取仍乱，非回归，验证白名单 |
 | 21 | 特征串混入同形字 | 残留检测特征串必须只含简繁字形不同的字（见 verify.py TRAD），否则误报 8500+ |
 | 22 | 无法目视图片 | 视觉检查只能靠墨迹密度分析（1.0x 渲染） |
+| 23 | 并发转换竞争 | 固定 `/tmp` 子集/原字体目录会被并发转换互相覆盖 → rebuild 读到别的文档的子集 → 大范围 notdef/`\x00`（症状：常用字变 `\x00`、嵌入流却含字形）。修复：`tempfile.mkdtemp` 每进程独立目录 |
+| 24 | 死字体回收 | redaction 后原字体残留于页面/Form 的 Resources，`garbage=3` 不回收（智谱实测 10.1MB）→ `purge_unused_fonts()` 保存前清理；需兼容 Resources/Font 直接字典与间接引用两种结构，资源名正则要含下划线 |
 
 ## 验证门槛（必须跑 verify.py，不验证不算完成）
 
@@ -131,7 +134,7 @@ python3 -m venv .venv
 - **字体风格**：转换过的 span 及原字体不可映射的 span（CID CFF 无 Unicode cmap）存在字形替换（原始细宋体→标准宋体，笔画略粗，墨迹可增 30%~135%）；未转换 span 复用原字体（TrueType 类），无此问题。
 - **横向拉伸丢失**：原始约 2% 的 span 使用非等比横向拉伸（text matrix 1.28× 等，常见于页眉），`insert_text` 不支持非等比缩放，重绘后字距归为正常 em（该行文字变窄约 20%，位置不漂移）。
 - **提取顺序**：个别竖排/表格密集页与原始内容流顺序不同（重建后更符合阅读顺序）。
-- **文件体积**：不子集化导致输出约 60MB（原始 ~8MB），完整字体嵌入所致。
+- **文件体积**：v1.1 起系统字体预子集化 + ZO 原字体完整嵌入，输出约 12-18MB（v1.0 为 ~60MB）；ZO 原字体不子集化是为保证字形保真。
 
 ## 参考
 

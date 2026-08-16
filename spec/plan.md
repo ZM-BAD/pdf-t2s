@@ -25,8 +25,20 @@
    - 五维验证全量执行
    - 验收标准 1-8 全部通过，收缩/回退计数写入报告
 
+4. **Slice 4 — 两阶段子集化（v1.1，scripts/pdf_t2s.py）**：
+   - 提取 `pick_font(fonts, doc_fonts, fname, bold, orig_text, new_text)`：横排/竖排统一的字体选择（转换过 → fallback；未转换 + 原字体可映射 → original；否则 → fallback），返回 (资源名, 文件路径, 测量用 fitz.Font)
+   - `collect_needed_chars(doc, cc, fonts, doc_fonts_all)`：阶段 1 字符收集——全文档逐页 collect_rows + 转换 + pick_font，按字体文件路径累积字符集（竖排逐字符）
+   - `subset_system_fonts(needed)`：阶段 2 子集化——仅系统字体路径（CJK_FONTS/LATIN_SERIF 值集），fontTools `Subsetter(unicodes_requested=...)` 输出到 `/tmp/pdf-t2s-subsets/`，异常回退原路径
+   - `rebuild_page` 增加 font_path_map 参数：insert_text 的 fontfile 经映射替换；测量仍用完整字体对象
+   - 验证：pick_font 与原逻辑等价（合成 PDF 断言字体选择不变）；子集化后体积缩小、PS 名保留 `ZT2S-` 前缀、提取无乱码
+
+5. **Slice 5 — 验收（v1.1）**：
+   - 两份验收文档全量转换 + 五维验证
+   - 验收标准 1-10 全部通过（1-8 与 v1.0 一致；9 体积 ≤ 15MB 且减 ≥ 70%；10 全过）
+   - 体积报告写入转换输出，spec status → shipped
+
 ## Verification
 
 - Per slice: 单元测试通过（venv 全量、裸 python 优雅跳过）
-- Acceptance: 验收标准 1-8（spec.md）对两份真实文档全量执行
-- Rollback: `git restore scripts/pdf_t2s.py scripts/verify.py tests/`（当前无提交改动，直接还原）
+- Acceptance: 验收标准 1-10（spec.md）对两份真实文档全量执行
+- Rollback: `git restore scripts/pdf_t2s.py scripts/verify.py tests/ spec/`（当前无提交改动，直接还原）

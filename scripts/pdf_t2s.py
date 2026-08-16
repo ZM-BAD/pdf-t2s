@@ -10,7 +10,11 @@
      - 转换过的 span: 系统简体字体（宋体→Songti SC、黑体→Hiragino Sans GB、
        拉丁宋体→Times New Roman），PS 名已加 ZT2S- 前缀防与 PDF 原字体冲突
      - 未转换 span: 用原始内嵌字体（字形 100% 还原）
-  6. 不使用 subset_fonts（其 ToUnicode 生成对部分字体映射错误），
+  6. 体积优化（v1.1）: 两阶段子集化——重绘前全文档收集每个系统字体实际
+     用到的字符集，fontTools 预子集化后嵌入（绕开 doc.subset_fonts 的
+     ToUnicode bug：MuPDF 嵌入的已是合法子集，ToUnicode 由 cmap 正常生成）。
+     原 PDF 内嵌字体（ZO）已是子集，不子集化。
+  7. 不使用 doc.subset_fonts()（其 ToUnicode 生成对部分字体映射错误），
      不用 TextWriter（其字体资源重复注册导致保存后部分字体提取乱码）
 
 用法:
@@ -20,13 +24,19 @@
 
 import argparse
 import os
+import tempfile
 import time
 
 import fitz
 import opencc
+from fontTools.subset import Options, Subsetter
+from fontTools.ttLib import TTFont
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-ORIG_FONT_DIR = "/tmp/pdf-t2s-origfonts"
+# 每进程独立临时目录（踩坑: 固定 /tmp 目录会被并发转换互相覆盖，
+# 导致 rebuild 阶段读到别的文档的子集/原字体文件 -> notdef/\x00）
+ORIG_FONT_DIR = tempfile.mkdtemp(prefix="pdf-t2s-origfonts-")
+SUBSET_DIR = tempfile.mkdtemp(prefix="pdf-t2s-subsets-")
 
 CJK_FONTS = {  # (黑体/宋体, 常规/粗体) -> ttf
     ("sans", 0): os.path.join(BASE, "t2s-sans-regular.ttf"),
@@ -39,6 +49,8 @@ LATIN_SERIF = {
     16: os.path.join(BASE, "t2s-times-bold.ttf"),
 }
 BOLD_FLAG = 16
+# 可子集化的系统字体路径集（原 PDF 内嵌字体 ZO 不在此列，保持完整嵌入）
+SYSTEM_FONT_PATHS = set(CJK_FONTS.values()) | set(LATIN_SERIF.values())
 
 
 def load_fonts():
@@ -208,14 +220,171 @@ def latin_font(fonts, fname, bold):
     return f"ZS{bold}", CJK_FONTS[("sans", bold)]
 
 
-def rebuild_page(page, cc, fonts, doc_fonts):
+def pick_font(fonts, doc_fonts, fname, bold, orig_text, new_text):
+    """字体选择（横排/竖排统一，v1.1 从 rebuild_page 提取）:
+    返回 (资源名, 字体文件路径, 测量用 fitz.Font)。
+    - 文本转换过 → 系统字体（fallback_font，按黑体/宋体类与字形可用性）
+    - 未转换且原字体可映射 → 原 PDF 内嵌字体（字形 100% 还原）
+    - 未转换但原字体不可提取/不可映射 → 系统字体回退
+    字符收集（阶段 1）与重绘（阶段 3）复用同一函数，保证子集覆盖全部绘制字符。"""
+    if new_text != orig_text:
+        rn, fp, meas = fallback_font(
+            fonts, fname, bold, new_text, any(is_cjk(c) for c in new_text)
+        )
+    elif font_key(fname) in doc_fonts and all(
+        can_map(doc_fonts[font_key(fname)][0], c) for c in new_text
+    ):
+        rn, fp = original_font(fname, doc_fonts)
+        meas = doc_fonts[font_key(fname)][0]
+    else:
+        rn, fp, meas = fallback_font(
+            fonts, fname, bold, new_text, any(is_cjk(c) for c in new_text)
+        )
+    return rn, fp, meas
+
+
+def collect_needed_chars(doc, cc, fonts, doc_fonts_all):
+    """阶段 1: 全文档扫描，按字体文件路径收集实际绘制的字符集。
+    与重绘使用同一 pick_font（同输入同输出），子集必然覆盖全部绘制字符。
+    竖排文本逐字符收集。"""
+    needed = {}
+    for pno in range(len(doc)):
+        doc_fonts = doc_fonts_all[pno]
+        for _, spans in collect_rows(doc[pno]):
+            for bbox, origin, text, size, color, fname, bold, chars in spans:
+                new = cc.convert(text).replace("於", "于")
+                if chars is not None:
+                    for ch, _ in chars:
+                        ch_new = cc.convert(ch).replace("於", "于")
+                        _, fp, _ = pick_font(fonts, doc_fonts, fname, bold, ch, ch_new)
+                        needed.setdefault(fp, set()).add(ch_new)
+                else:
+                    _, fp, _ = pick_font(fonts, doc_fonts, fname, bold, text, new)
+                    needed.setdefault(fp, set()).update(new)
+    return needed
+
+
+def subset_system_fonts(needed):
+    """阶段 2: 仅子集化系统字体（SYSTEM_FONT_PATHS），输出到 SUBSET_DIR。
+    子集化失败（异常字体）回退完整字体，不中断转换。返回 {原路径: 子集路径}。
+    用 unicodes_requested（fontTools 4.63 API）保证字符覆盖；子集化保留
+    ZT2S- 前缀 PS 名（MuPDF 嵌入时资源命名依赖它防撞名）。"""
+    os.makedirs(SUBSET_DIR, exist_ok=True)
+    mapping = {}
+    for fp, chars in needed.items():
+        if fp not in SYSTEM_FONT_PATHS or not chars:
+            continue
+        out = os.path.join(SUBSET_DIR, os.path.basename(fp))
+        try:
+            font = TTFont(fp)
+            ss = Subsetter(options=Options())
+            ss.unicodes_requested = {ord(c) for c in chars}
+            ss.subset(font)
+            font.save(out)
+            mapping[fp] = out
+        except Exception:  # noqa: BLE001, S112 — 子集化失败回退完整字体，不中断转换
+            continue
+    return mapping
+
+
+_TF_RE = None
+_FONT_KEY_RE = None
+
+
+def purge_unused_fonts(doc):
+    """保存前清理（v1.1 补充）: 删除页面/Form 的 Resources/Font 中内容流未
+    引用的字体条目。redaction 后原字体对象残留且被 Resources 持有引用，
+    garbage=3 无法回收（智谱实测 72 个死字体 / 10.1MB）。扫描范围含页面内容
+    流与全部 Form XObject 内容流（Form 引用的字体不删，防视觉破坏）。
+    兼容 Resources/Font 为直接字典或间接引用两种结构。返回清理条目数。"""
+    import re
+
+    global _TF_RE, _FONT_KEY_RE
+    if _TF_RE is None:
+        _TF_RE = re.compile(rb"/([A-Za-z0-9_]+)\s+[\d.]+\s+Tf")  # 资源名可含下划线
+    if _FONT_KEY_RE is None:
+        _FONT_KEY_RE = re.compile(r"/([A-Za-z0-9_]+)\s+\d+\s+0\s+R")
+    used = set()
+    forms = []
+    for pno in range(len(doc)):
+        for xref in doc[pno].get_contents():
+            data = doc.xref_stream(xref)
+            if data:
+                used |= set(_TF_RE.findall(data))
+    for xref in range(1, doc.xref_length()):
+        if doc.xref_get_key(xref, "Subtype")[1].strip("/") == "Form":
+            forms.append(xref)
+            data = doc.xref_stream(xref)
+            if data:
+                used |= set(_TF_RE.findall(data))
+    used = {n.decode() for n in used}
+
+    def purge_obj(obj_xref):
+        """清理单个对象（页面/Form）的 Resources/Font 死条目"""
+        n = 0
+        t, v = doc.xref_get_key(obj_xref, "Resources")
+        if t == "xref":  # Resources 是间接对象
+            res_xref = int(v.split()[0])
+            t2, v2 = doc.xref_get_key(res_xref, "Font")
+            if t2 == "xref":  # Font 是间接对象 -> 在其上直接置 null
+                fd = int(v2.split()[0])
+                for key in doc.xref_get_keys(fd):
+                    if key not in used:
+                        doc.xref_set_key(fd, key, "null")
+                        n += 1
+            elif t2 == "dict":  # Font 是直接字典 -> 路径写法
+                for key in _FONT_KEY_RE.findall(v2):
+                    if key not in used:
+                        doc.xref_set_key(res_xref, f"Font/{key}", "null")
+                        n += 1
+        elif t == "dict":  # Resources 是直接字典
+            t2, v2 = doc.xref_get_key(obj_xref, "Resources/Font")
+            if t2 == "dict":
+                for key in _FONT_KEY_RE.findall(v2):
+                    if key not in used:
+                        doc.xref_set_key(obj_xref, f"Resources/Font/{key}", "null")
+                        n += 1
+        return n
+
+    purged = 0
+    for pno in range(len(doc)):
+        purged += purge_obj(doc[pno].xref)
+    for fx in forms:
+        purged += purge_obj(fx)
+    return purged
+
+
+def collect_blank_bboxes(page):
+    """纯空白 span 的 bbox（v1.1 体积优化）: redact 掉它们使内容流不再引用
+    其原字体资源（C0_0 等残留引用，占体积数 MB），保存时由 purge/garbage 回收。
+    空白字符提取为空白（norm 后无差异），视觉不可见，删除无影响。"""
+    out = []
+    for block in page.get_text("rawdict")["blocks"]:
+        if block["type"] != 0:
+            continue
+        for line in block["lines"]:
+            for s in line["spans"]:
+                t = "".join(c["c"] for c in s["chars"])
+                if t and not t.strip():
+                    bbox = fitz.Rect(s["bbox"])
+                    if not bbox.is_empty and bbox.width > 0 and bbox.height > 0:
+                        out.append(bbox)
+    return out
+
+
+def rebuild_page(page, cc, fonts, doc_fonts, font_path_map=None):
+    """逐页重绘。font_path_map: 系统字体 {原路径: 子集路径}（v1.1），
+    insert_text 的 fontfile 经映射替换；测量仍用完整字体（度量一致）。"""
+    font_path_map = font_path_map or {}
     rows = collect_rows(page)
     if not rows:
         return 0
-    # 1) 删除全部旧文本（图片/矢量线保留）
+    # 1) 删除全部旧文本（图片/矢量线保留）——含纯空白 span（v1.1: 清字体残留引用）
     for _, spans in rows:
         for bbox, *_ in spans:
             page.add_redact_annot(bbox)
+    for bbox in collect_blank_bboxes(page):
+        page.add_redact_annot(bbox)
     page.apply_redactions(
         images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE
     )
@@ -234,37 +403,17 @@ def rebuild_page(page, cc, fonts, doc_fonts):
                     ch_new = cc.convert(ch).replace("於", "于")
                     if ch_new != ch:
                         changed += 1
-                        rn, fp, _ = fallback_font(
-                            fonts, fname, bold, ch_new, is_cjk(ch_new)
-                        )
-                    elif font_key(fname) in doc_fonts and can_map(
-                        doc_fonts[font_key(fname)][0], ch
-                    ):
-                        rn, fp = original_font(fname, doc_fonts)
-                    else:
-                        rn, fp, _ = fallback_font(fonts, fname, bold, ch, is_cjk(ch))
+                    rn, fp, _ = pick_font(fonts, doc_fonts, fname, bold, ch, ch_new)
                     shape.insert_text(
                         ch_origin,
                         ch_new,
                         fontname=rn,
-                        fontfile=fp,
+                        fontfile=font_path_map.get(fp, fp),
                         fontsize=size,
                         color=int2rgb(color),
                     )
             else:
-                has_cjk = any(is_cjk(c) for c in new)
-                if new != text:
-                    # 转换过的 span: 需要简体字形 → 系统字体
-                    rn, fp, meas = fallback_font(fonts, fname, bold, new, has_cjk)
-                elif font_key(fname) in doc_fonts and all(
-                    can_map(doc_fonts[font_key(fname)][0], c) for c in new
-                ):
-                    # 未转换 span: 复用原 PDF 内嵌字体（字形 100% 还原）
-                    rn, fp = original_font(fname, doc_fonts)
-                    meas = doc_fonts[font_key(fname)][0]
-                else:
-                    # 未转换 span 且原字体不可提取/不可映射 → 系统字体回退
-                    rn, fp, meas = fallback_font(fonts, fname, bold, new, has_cjk)
+                rn, fp, meas = pick_font(fonts, doc_fonts, fname, bold, text, new)
                 # 宽度收缩: 以实际绘制字体度量（未转换 span 用原字体度量一致，不触发）
                 fit_w = meas.text_length(new, fontsize=size)
                 if fit_w > bbox.width * 1.02 and fit_w > 0:
@@ -273,7 +422,7 @@ def rebuild_page(page, cc, fonts, doc_fonts):
                     origin,
                     new,
                     fontname=rn,
-                    fontfile=fp,
+                    fontfile=font_path_map.get(fp, fp),
                     fontsize=size,
                     color=int2rgb(color),
                 )
@@ -289,9 +438,22 @@ def process_pdf(src, cc, fonts, out=None):
     doc_fonts = load_doc_fonts(doc)
     n_fonts = len({f for pf in doc_fonts.values() for f in pf})
     print(f"  可用原字体 {n_fonts} 个", flush=True)
+    # v1.1 体积优化: 阶段 1 收集字符集 -> 阶段 2 子集化系统字体
+    # （绕开 doc.subset_fonts 的 ToUnicode bug，MuPDF 嵌入的已是合法子集）
+    print("  收集所需字符集…", flush=True)
+    needed = collect_needed_chars(doc, cc, fonts, doc_fonts)
+    font_path_map = subset_system_fonts(needed)
+    if font_path_map:
+        saved = sum(
+            os.path.getsize(k) - os.path.getsize(v) for k, v in font_path_map.items()
+        )
+        print(
+            f"  子集化系统字体 {len(font_path_map)} 个 (节省 {saved / 1e6:.1f}MB)",
+            flush=True,
+        )
     total_changed = changed_pages = 0
     for pno in range(n):
-        changed = rebuild_page(doc[pno], cc, fonts, doc_fonts[pno])
+        changed = rebuild_page(doc[pno], cc, fonts, doc_fonts[pno], font_path_map)
         if changed:
             changed_pages += 1
             total_changed += changed
@@ -303,8 +465,11 @@ def process_pdf(src, cc, fonts, out=None):
             )
     if out is None:
         out = src.rsplit(".pdf", 1)[0] + "_简体.pdf"
-    # 注意: 不使用 subset_fonts（ToUnicode 生成对部分字体映射错误，导致
-    # "财务资料"等提取成控制字符），保留完整字体嵌入保证提取正确
+    # 注意: 不使用 doc.subset_fonts()（ToUnicode 生成对部分字体映射错误，导致
+    # "财务资料"等提取成控制字符）；体积由 fontTools 预子集化控制（见上）
+    n_purged = purge_unused_fonts(doc)
+    if n_purged:
+        print(f"  清理未引用字体条目 {n_purged} 个", flush=True)
     doc.save(out, garbage=3, deflate=True)
     doc.close()
     size_mb = os.path.getsize(out) / 1024 / 1024
