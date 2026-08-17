@@ -35,5 +35,8 @@ jobs:
         with:
           python-version: "3.14"
       - run: pip install -r requirements.txt pytest==9.1.1
+      # scripts/t2s-*.ttf 为版权字体（prepare_fonts.py 从 macOS 系统字体提取），
+      # 不入库，CI 上 8 个字体相关测试会 SKIP（13 passed, 8 skipped）；
+      # 完整 21 个测试在本地 venv 全量运行（make test）。-rs 打印跳过原因。
       - name: pytest
-        run: python -m pytest -q
+        run: python -m pytest -q -rs

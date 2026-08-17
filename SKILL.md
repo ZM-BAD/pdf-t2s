@@ -43,7 +43,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python3 scripts/prepare_fonts.py      # 生成 t2s-*.ttf 到 scripts/（不入库）
 
-# 2. 转换（本地，逐页处理）
+# 2. 转换（本地；页数 ≥50 自动多进程并行，--jobs N 可调，--jobs 1 强制串行）
 .venv/bin/python3 scripts/pdf_t2s.py 输入.pdf [更多输入.pdf...]
 
 # 3. 验证（必须！）
@@ -59,7 +59,7 @@ python3 -m venv .venv
 5. 全部 span（**含竖排**）加 redact 注释并应用：`apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)`——显式保留图片和矢量线。
 6. 逐行重绘：每视觉行一个 `fitz.Shape(page)`，行内 span 按 x0 排序逐个 `shape.insert_text(...)`，然后 **`shape.commit()`（必须每行 commit，产生独立内容流 → 提取顺序 = 视觉行序）**。
 7. 竖排 span：对 chars **逐字符**转换并按其 origin 重绘，保持竖排排列。
-8. 字体选择（防缺字形/撞名，规范见 spec/spec.md）:
+8. 字体选择（防缺字形/撞名，规范见 spec/001-pdf-t2s-core.md）:
    - span 文本有变化（含繁体）→ 系统简体字体（资源名 `ZS0/ZS1`/`ZR0/ZR1`/`ZT0/ZT1`，见下节字体映射）。
    - span 无变化 → 原 PDF 内嵌字体（`doc.extract_font(xref)[3]` 写临时文件，资源名 `ZO<idx>`）。匹配键为**去 subset 前缀后的 PS 名**（`SPNAJD+MHeiHK-Bold` ≡ `MHeiHK-Bold`），且**复用前逐字符 `has_glyph` 探测映射可用性**——CID CFF 等无 Unicode cmap 的字体（SourceHanSans/MSungHK）`insert_text` 无法映射，回退系统字体；TrueType 字体（TimesLTStd 等）正常复用。
    - 原字体不可提取或不可映射 → 纯拉丁用 Times、含 CJK 用系统字体。
@@ -112,7 +112,7 @@ python3 -m venv .venv
 
 ## 验证门槛（必须跑 verify.py，不验证不算完成）
 
-`scripts/verify.py` 对原始/输出逐页做五维验证（规范见 spec/spec.md）:
+`scripts/verify.py` 对原始/输出逐页做五维验证（规范见 spec/001-pdf-t2s-core.md）:
 
 1. **内容级（最重要）**：norm 后字符 multiset（Counter）对比——查丢字/漏转。差异按白名单分类（於/于 补丁、标点变体、原始固有乱码），**非白名单差异必须为 0**。
 2. **顺序级（参考）**：SequenceMatcher ratio——输出为视觉阅读序，与原始内容流序不同是预期。

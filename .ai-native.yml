@@ -22,8 +22,10 @@ stages:
     date: "2026-08-14"
     templateVersion: "0.12.0"
     files:
-      - "spec/spec.md"
-      - "spec/plan.md"
-      - "spec/tasks.md"
+      - "spec/000-spec-template.md"
+      - "spec/001-pdf-t2s-core.md"
+      - "spec/002-output-size-optimization.md"
+      - "spec/003-parallel-conversion.md"
+      - "spec/ROADMAP.md"
       - ".github/workflows/sdd.yml"
       - "AGENTS.md"

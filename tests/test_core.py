@@ -329,6 +329,93 @@ class TestHelpers(unittest.TestCase):
         # 体积: 子集嵌入应远小于完整 serif (20MB)
         self.assertLess(os.path.getsize(out) / 1e6, 1.0, f"子集嵌入体积过大: {out}")
 
+    def test_split_blocks(self):
+        # 003: 块划分均分、末块含余数、jobs>n 时块不重叠
+        self.assertEqual(
+            self.m._split_blocks(100, 4),
+            [(0, 0, 25), (1, 25, 50), (2, 50, 75), (3, 75, 100)],
+        )
+        self.assertEqual(
+            self.m._split_blocks(10, 4), [(0, 0, 2), (1, 2, 4), (2, 4, 6), (3, 6, 10)]
+        )
+        self.assertEqual(
+            self.m._split_blocks(3, 8),
+            [
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (5, 0, 0),
+                (6, 0, 0),
+                (7, 0, 3),
+            ],
+        )
+        # 覆盖全部页且不重叠
+        for n, jobs in [(100, 4), (10, 4), (3, 8), (50, 1)]:
+            blocks = self.m._split_blocks(n, jobs)
+            pages = []
+            for _, s, e in blocks:
+                pages.extend(range(s, e))
+            self.assertEqual(sorted(pages), list(range(n)))
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_parallel_degradation_small(self):
+        # 003: 页数 < PARALLEL_MIN_PAGES -> 降级串行，输出正确
+        import fitz
+        import opencc
+
+        from scripts import pdf_t2s
+
+        serif = pdf_t2s.CJK_FONTS[("serif", 0)]
+        doc = fitz.open()
+        for _ in range(3):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 72), "繁體字測試", fontname="F0", fontfile=serif, fontsize=12
+            )
+        src = os.path.join(tempfile.mkdtemp(), "small.pdf")
+        doc.save(src)
+        doc.close()
+        cc = opencc.OpenCC("t2s")
+        fonts = pdf_t2s.load_fonts()
+        out = pdf_t2s.process_pdf_parallel(src, cc, fonts, jobs=4)
+        d2 = fitz.open(out)
+        got = "".join(d2[p].get_text() for p in range(len(d2)))
+        d2.close()
+        self.assertEqual(self.v.norm(got), "繁体字测试" * 3, f"降级输出不符: {got!r}")
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_parallel_end_to_end(self):
+        # 003: 60 页合成文档 jobs=2 并行 -> 文本正确、无 \x00
+        import fitz
+        import opencc
+
+        from scripts import pdf_t2s
+
+        serif = pdf_t2s.CJK_FONTS[("serif", 0)]
+        doc = fitz.open()
+        for _ in range(60):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 72), "繁體字測試2021年", fontname="F0", fontfile=serif, fontsize=12
+            )
+        src = os.path.join(tempfile.mkdtemp(), "par.pdf")
+        doc.save(src)
+        doc.close()
+        cc = opencc.OpenCC("t2s")
+        fonts = pdf_t2s.load_fonts()
+        out = pdf_t2s.process_pdf_parallel(src, cc, fonts, jobs=2)
+        d2 = fitz.open(out)
+        self.assertEqual(len(d2), 60)
+        bad = 0
+        for p in range(len(d2)):
+            t = d2[p].get_text()
+            if "\x00" in t or self.v.norm(t) != "繁体字测试2021年":
+                bad += 1
+        d2.close()
+        self.assertEqual(bad, 0, f"并行输出 {bad} 页文本异常")
+
 
 if __name__ == "__main__":
     unittest.main()

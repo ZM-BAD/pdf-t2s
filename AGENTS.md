@@ -36,6 +36,6 @@ Repository: pdf-t2s — see README.md for human-facing docs.
 
 ## Spec-driven workflow (SDD)
 
-- Every feature starts as a spec: `spec/spec.md` (proposed → approved → in-progress → shipped)
-- Implement in independently verifiable slices (spec/plan.md), tracked in spec/tasks.md
+- Every feature starts as a spec: `spec/001-*.md`（每个里程碑一个编号 spec，proposed → approved → in-progress → shipped），模板见 `spec/000-spec-template.md`，总览见 `spec/ROADMAP.md`
+- Implement in independently verifiable slices（各 spec 内 Implementation Plan 小节）
 - The sdd CI gate fails when spec files are missing — specs are first-class

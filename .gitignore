@@ -28,3 +28,6 @@ orig_fonts/
 
 # spooner check 基线账本（本地记录，不入库；.ai-native.yml 清单入库）
 .ai-native/
+
+# 开发交接文档（本地过程记录，不入库；规范以 spec/ 为准）
+handoff.md

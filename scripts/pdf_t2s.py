@@ -23,6 +23,7 @@
 """
 
 import argparse
+import multiprocessing as mp
 import os
 import tempfile
 import time
@@ -37,6 +38,8 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # 导致 rebuild 阶段读到别的文档的子集/原字体文件 -> notdef/\x00）
 ORIG_FONT_DIR = tempfile.mkdtemp(prefix="pdf-t2s-origfonts-")
 SUBSET_DIR = tempfile.mkdtemp(prefix="pdf-t2s-subsets-")
+# 并行转换（003）: 页数低于该值走串行（分块固定开销 > 并行收益）
+PARALLEL_MIN_PAGES = 50
 
 CJK_FONTS = {  # (黑体/宋体, 常规/粗体) -> ttf
     ("sans", 0): os.path.join(BASE, "t2s-sans-regular.ttf"),
@@ -482,6 +485,148 @@ def process_pdf(src, cc, fonts, out=None):
     return out
 
 
+def dedup_fonts(doc):
+    """合并后手动去重（003）: 同 PS 名且字体流相同的对象统一指向首个 xref。
+    garbage=4 的流合并是 O(n²) 比较（504 页实测 45s+），哈希去重 O(n) 且
+    确定性（实测 <1s）。被替换对象由后续 garbage=3 回收。"""
+    import hashlib
+
+    seen = {}
+    redirects = []
+    for pno in range(len(doc)):
+        page = doc[pno]
+        for row in page.get_fonts(full=True):
+            xref, _, _, basefont, rn, _, _ = row
+            try:
+                buf = doc.extract_font(xref)[3]
+                size = len(buf) if buf else -1
+                md5 = hashlib.md5(buf).hexdigest() if buf else ""
+            except Exception:  # noqa: BLE001, S112 — 单字体提取失败跳过
+                continue
+            key = (font_key(basefont), size, md5)
+            if key not in seen:
+                seen[key] = xref
+            else:
+                redirects.append((page.xref, rn, xref, seen[key]))
+    n = 0
+    for px, rn, old, new in redirects:
+        if old == new:
+            continue
+        try:
+            doc.xref_set_key(px, f"Resources/Font/{rn}", f"{new} 0 R")
+            n += 1
+        except Exception:  # noqa: BLE001, S112 — 间接 Resources 路径不可操作，跳过
+            continue
+    return n
+
+
+def _split_blocks(n, jobs):
+    """页数均分块边界: [(块号, 起始页, 结束页)]，末块含余数"""
+    per = n // jobs
+    out = []
+    for i in range(jobs):
+        s = i * per
+        e = n if i == jobs - 1 else (i + 1) * per
+        out.append((i, s, e))
+    return out
+
+
+def _block_worker(args):
+    """块 worker（003 并行转换）: 每进程独立打开原 PDF，处理块内页，
+    只保留块内页后保存块文件。必须模块级可 pickle（macOS spawn）。"""
+    block_idx, start, end, src, submap_path, block_dir = args
+    try:
+        cc = opencc.OpenCC("t2s")
+        fonts = load_fonts()
+        with open(submap_path) as fh:
+            font_path_map = dict(
+                line.strip().split("\t") for line in fh if line.strip()
+            )
+        doc = fitz.open(src)
+        doc_fonts = load_doc_fonts(doc)
+        changed = 0
+        for pno in range(start, end):
+            changed += rebuild_page(doc[pno], cc, fonts, doc_fonts[pno], font_path_map)
+        doc.select(list(range(start, end)))  # 只保留块内页
+        out = os.path.join(block_dir, f"block-{block_idx}.pdf")
+        doc.save(out, garbage=3, deflate=True)
+        doc.close()
+        return out, changed
+    except Exception as e:  # noqa: BLE001 — 返回异常由主进程统一报告
+        return e
+
+
+def process_pdf_parallel(src, cc, fonts, out=None, jobs=None):
+    """多进程分块转换（003）: 阶段 1 全局字符收集+子集化（串行）→
+    阶段 2 分块并行重建 → 阶段 3 insert_pdf 合并 + garbage=2 保存。
+    jobs=None 自动 = min(cpu_count, 页数)；页数 < PARALLEL_MIN_PAGES 或
+    jobs=1 降级串行（process_pdf）。"""
+    t0 = time.time()
+    doc = fitz.open(src)
+    n = len(doc)
+    if jobs is None:
+        jobs = max(1, min(mp.cpu_count(), n))
+    if n < PARALLEL_MIN_PAGES or jobs <= 1:
+        doc.close()
+        return process_pdf(src, cc, fonts, out)
+    print(f"  并行转换 {jobs} 进程 × {n} 页…", flush=True)
+    # 阶段 1: 全局字符收集（子集化依赖全文档字符集，必须串行一次）
+    doc_fonts = load_doc_fonts(doc)
+    n_fonts = len({f for pf in doc_fonts.values() for f in pf})
+    print(f"  可用原字体 {n_fonts} 个", flush=True)
+    needed = collect_needed_chars(doc, cc, fonts, doc_fonts)
+    font_path_map = subset_system_fonts(needed)
+    doc.close()
+    if font_path_map:
+        saved = sum(
+            os.path.getsize(k) - os.path.getsize(v) for k, v in font_path_map.items()
+        )
+        print(
+            f"  子集化系统字体 {len(font_path_map)} 个 (节省 {saved / 1e6:.1f}MB)",
+            flush=True,
+        )
+    # 子集映射写临时文件供子进程读取
+    submap = os.path.join(SUBSET_DIR, "font_path_map.txt")
+    with open(submap, "w") as fh:
+        fh.writelines(f"{k}\t{v}\n" for k, v in font_path_map.items())
+    # 阶段 2: 分块并行重建
+    block_dir = tempfile.mkdtemp(prefix="pdf-t2s-blocks-")
+    chunks = [(*b, src, submap, block_dir) for b in _split_blocks(n, jobs)]
+    with mp.Pool(jobs) as pool:
+        results = pool.map(_block_worker, chunks)
+    total_changed = 0
+    for r in results:
+        if isinstance(r, Exception):
+            raise RuntimeError(f"块转换失败: {r}")  # noqa: TRY004 — 块失败是业务错误非类型错误
+        total_changed += r[1]
+    # 阶段 3: 合并 + 手动字体去重 + 清理 + 保存。
+    # dedup_fonts: 块间重复字体流（每块嵌入同一全局子集）统一 xref——
+    # garbage=4 的流合并是 O(n²) 比较（504 页实测 45s+），哈希去重 O(n)
+    merged = fitz.open()
+    for i in range(jobs):
+        blk = fitz.open(os.path.join(block_dir, f"block-{i}.pdf"))
+        merged.insert_pdf(blk, annots=False, links=False)
+        blk.close()
+    n_dedup = dedup_fonts(merged)
+    n_purged = purge_unused_fonts(merged)
+    if n_dedup:
+        print(f"  合并去重字体 {n_dedup} 处", flush=True)
+    if n_purged:
+        print(f"  清理未引用字体条目 {n_purged} 个", flush=True)
+    if out is None:
+        out = src.rsplit(".pdf", 1)[0] + "_简体.pdf"
+    merged.save(out, garbage=3, deflate=True, deflate_fonts=True)
+    merged.close()
+    size_mb = os.path.getsize(out) / 1024 / 1024
+    print(
+        f"完成 {os.path.basename(src)} -> {os.path.basename(out)} "
+        f"({size_mb:.1f}MB) | 改字 span {total_changed}，涉及页 {n}/{n}，"
+        f"耗时 {time.time() - t0:.0f}s（并行 {jobs} 进程）",
+        flush=True,
+    )
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="繁体 PDF → 简体 PDF（保留原排版，本地处理）"
@@ -489,6 +634,13 @@ def main():
     parser.add_argument("srcs", nargs="+", help="输入繁体 PDF 路径（可多个）")
     parser.add_argument(
         "--output", "-o", help="输出路径（仅单个输入时可用；默认 <原名>_简体.pdf）"
+    )
+    parser.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        help="并行进程数（默认: min(CPU核数, 页数)；1=强制串行；页数<50 自动串行）",
     )
     args = parser.parse_args()
     if args.output and len(args.srcs) > 1:
@@ -499,7 +651,7 @@ def main():
         if not os.path.exists(src):
             print(f"跳过（不存在）: {src}", flush=True)
             continue
-        process_pdf(src, cc, fonts, out=args.output)
+        process_pdf_parallel(src, cc, fonts, out=args.output, jobs=args.jobs)
 
 
 if __name__ == "__main__":

@@ -17,5 +17,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Check spec/spec.md exists
-        run: test -f spec/spec.md
+      - name: Check spec files exist (template + numbered specs + roadmap)
+        run: test -f spec/000-spec-template.md && test -f spec/001-pdf-t2s-core.md && test -f spec/002-output-size-optimization.md && test -f spec/003-parallel-conversion.md && test -f spec/ROADMAP.md

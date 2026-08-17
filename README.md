@@ -14,6 +14,7 @@
 - **本地处理**：全程不离开本机，敏感文件无需上传云端
 - **内置验证**：`verify.py` 五维验证（内容 / 顺序 / 字体保真 / 像素 / 竖排），不验证不算完成
 - **批量转换**：一次命令处理多个 PDF
+- **并行转换**：多进程分块重建（默认用满 CPU 核，页数 ≥ 50 自动启用；`--jobs N` 可调，`--jobs 1` 强制串行）
 
 ## 安装
 
@@ -36,6 +37,9 @@ python3 -m venv .venv
 
 # 指定输出路径（仅单文件）
 .venv/bin/python3 scripts/pdf_t2s.py 输入.pdf --output 输出.pdf
+
+# 控制并行（默认自动：页数≥50 用满 CPU 核；大文档可限制进程数控内存）
+.venv/bin/python3 scripts/pdf_t2s.py 输入.pdf --jobs 4
 
 # 验证（必须！不验证不算完成）
 .venv/bin/python3 scripts/verify.py 输入.pdf 输出_简体.pdf
@@ -75,7 +79,8 @@ pre-commit 与 CI 均包含 UT、lint、formatter 三关；CI 硬门槛见 `.git
 
 ## 已知限制
 
-- 输出体积约 12-18MB（v1.1 起用 fontTools 预子集化系统字体；原 PDF 内嵌字体 ZO 完整嵌入以保证字形保真——`doc.subset_fonts()` 有 ToUnicode bug 不可用，预子集化绕开该路径）。
+- 输出体积约 10-16MB（fontTools 预子集化系统字体；原 PDF 内嵌字体 ZO 完整嵌入以保证字形保真——`doc.subset_fonts()` 有 ToUnicode bug 不可用，预子集化绕开该路径；并行模式经字体去重后体积更小）。
+- 并行转换内存峰值约 2-3GB（进程数 × ~300MB），可用 `--jobs` 调低。
 - 个别标点复制时得到 unicode 变体（页面显示完全一样）。
 - 原始细宋体替换为标准宋体，笔画略粗。
 

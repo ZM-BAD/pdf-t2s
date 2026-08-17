@@ -1,5 +1,8 @@
 # CI workflow installed by spooner transform Stage 2 (python stack; warn-only
-# quality gates; hard gates: declared-command executability + .ai-native.yml consistency)
+# quality gates; hard gate: .ai-native.yml consistency)
+#
+# 精简说明（2026-08-17）: lint-test / format / declared-commands 与 ci.yml 的
+# ruff + pytest 门禁重复，已删除；单元测试由 ci.yml 全量覆盖。
 name: ai-native
 
 on:
@@ -37,51 +40,24 @@ jobs:
           git log -1 --format=%B > .git/COMMIT_EDITMSG
           pre-commit run --hook-stage commit-msg --commit-msg-filename .git/COMMIT_EDITMSG
 
-  lint-test:
-    name: lint + test (warn-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.13"
-      - run: pip install -e . || pip install .
-      - name: test
-        run: python3 -m unittest discover -q || [ $? -eq 5 ]
-  format:
-    name: format check (ruff, warn-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.13"
-      - run: pip install ruff
-      - run: ruff format --check scripts tests
   security:
     name: secret scan (gitleaks, warn-only)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # gitleaks-action@v2 按 before^..after 计算扫描范围，仓库首次推送
+      # （before 为根 commit，无父提交）时必然 fatal；改用 CLI 工作树扫描，
+      # 不依赖 commit range，任何分支状态都能跑。
+      - name: Install gitleaks (pinned)
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/
+      - name: gitleaks detect (working tree)
+        run: gitleaks detect --no-git --source . --redact --verbose
 
-  declared-commands:
-    name: declared lifecycle commands executable (hard gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.13"
-      - name: Run declared build/test commands
-        run: python3 -m unittest discover -q || [ $? -eq 5 ]
   manifest-consistency:
     name: .ai-native.yml consistency + template version (hard gate)
     runs-on: ubuntu-latest
