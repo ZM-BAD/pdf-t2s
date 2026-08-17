@@ -30,7 +30,7 @@ pdf-t2s/
 ├── scripts/
 │   ├── pdf_t2s.py         # 转换主脚本
 │   ├── verify.py          # 三级验证脚本
-│   └── prepare_fonts.py   # 从 macOS 系统字体提取重绘用字体（ZT2S- 前缀）
+│   └── prepare_fonts.py   # 跨平台字体准备（系统优先 + OFL 下载兜底，ZT2S- 前缀）
 ├── requirements.txt       # pymupdf opencc fonttools
 └── tests/                 # 单元测试（无依赖环境自动跳过）
 ```
@@ -38,10 +38,12 @@ pdf-t2s/
 ## 核心流程
 
 ```sh
-# 1. 准备环境（一次性，macOS）
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python3 scripts/prepare_fonts.py      # 生成 t2s-*.ttf 到 scripts/（不入库）
+# 1. 准备环境（一次性；macOS/Linux 用 .venv/bin/python3，Windows 用 .venv\Scripts\python）
+python3 -m venv .venv                                    # Windows: py -m venv .venv
+.venv/bin/pip install -r requirements.txt                # Windows: .venv\Scripts\pip install ...
+.venv/bin/python3 scripts/prepare_fonts.py               # 生成 t2s-*.ttf 到 scripts/（不入库）
+# prepare_fonts 系统字体优先（macOS: Hiragino/Songti/Times；Windows: 微软雅黑/宋体/Times；
+# Linux: Noto CJK/Liberation），缺槽位自动下载 OFL 补位；离线加 --no-download 降级
 
 # 2. 转换（本地；页数 ≥50 自动多进程并行，--jobs N 可调，--jobs 1 强制串行）
 .venv/bin/python3 scripts/pdf_t2s.py 输入.pdf [更多输入.pdf...]
@@ -69,15 +71,16 @@ python3 -m venv .venv
 
 输出文件命名：`原名_简体.pdf`（与输入同目录）。
 
-### 字体映射（macOS）
+### 字体映射（按平台）
 
 | 原始字体名包含 | 目标 | 资源名 | 文件 |
 |---|---|---|---|
-| MHei / Hei / Sans / Gothic（黑体类） | Hiragino Sans GB W3/W6 | ZS0/ZS1 | t2s-sans-regular/bold.ttf |
-| 其余（MSung / Song / Serif 等宋体类） | Songti SC Regular/Bold | ZR0/ZR1 | t2s-serif-regular/bold.ttf |
-| Times（纯拉丁且无 CJK） | Times New Roman | ZT0/ZT1 | t2s-times(-bold).ttf |
-| 原 PDF 内嵌字体（未转换 span） | 原字体 buffer（PS 名去 subset 前缀匹配） | ZO\<idx\> | /tmp/pdf-t2s-origfonts/f\<idx\>.\<ext\> |
+| MHei / Hei / Sans / Gothic（黑体类） | 黑体（macOS: Hiragino Sans GB；Windows: 微软雅黑；Linux: Noto Sans CJK SC） | ZS0/ZS1 | t2s-sans-regular/bold.ttf |
+| 其余（MSung / Song / Serif 等宋体类） | 宋体（macOS: Songti SC；Windows: 宋体 SimSun；Linux: Noto Serif CJK SC） | ZR0/ZR1 | t2s-serif-regular/bold.ttf |
+| Times（纯拉丁且无 CJK） | Times 类（macOS/Windows: Times New Roman；Linux: Liberation/DejaVu Serif） | ZT0/ZT1 | t2s-times(-bold).ttf |
+| 原 PDF 内嵌字体（未转换 span） | 原字体 buffer（PS 名去 subset 前缀匹配） | ZO\<idx\> | 临时目录 pdf-t2s-origfonts/f\<idx\>.\<ext\> |
 
+- `prepare_fonts.py` 按平台探测系统字体（Linux 多路径 + fc-match），缺槽位自动下载 OFL 补位（Noto CJK SC / Tinos），`--no-download` 完全离线（缺槽位降级：粗体→常规）。
 - 系统字体由 fontTools 从 ttc 提取 face 为独立 ttf，**PS 名（name[6]）加 `ZT2S-` 前缀**防与 PDF 原字体撞名。
 - `Shape.insert_text` 的 `fontfile` 只接受**文件路径**（不接受 buffer）——原字体 buffer 必须写临时文件。
 
@@ -109,6 +112,7 @@ python3 -m venv .venv
 | 22 | 无法目视图片 | 视觉检查只能靠墨迹密度分析（1.0x 渲染） |
 | 23 | 并发转换竞争 | 固定 `/tmp` 子集/原字体目录会被并发转换互相覆盖 → rebuild 读到别的文档的子集 → 大范围 notdef/`\x00`（症状：常用字变 `\x00`、嵌入流却含字形）。修复：`tempfile.mkdtemp` 每进程独立目录 |
 | 24 | 死字体回收 | redaction 后原字体残留于页面/Form 的 Resources，`garbage=3` 不回收（智谱实测 10.1MB）→ `purge_unused_fonts()` 保存前清理；需兼容 Resources/Font 直接字典与间接引用两种结构，资源名正则要含下划线 |
+| 25 | Windows 无宋体粗体 | simsun.ttc 只有 SimSun/NSimSun 两个常规 face → prepare_fonts 自动下载 Noto Serif CJK SC Bold 补位；离线时粗体槽位降级复用常规宋体（粗体 span 视觉变细，不影响正确性）。另：任何平台字体文件缺失时 `load_fonts()` 跳过并警告，`fallback_font` 只在已加载槽位中选（bold→常规、整族→另一族降级），全缺时报清晰错误 |
 
 ## 验证门槛（必须跑 verify.py，不验证不算完成）
 
@@ -132,6 +136,7 @@ python3 -m venv .venv
 
 - **标点 unicode 变体**：`-`→软连字符、`•`→`・`、`…`→`⋯`（字体 ToUnicode 一对多映射，页面显示一样，复制得到变体字符，无法根治）。
 - **字体风格**：转换过的 span 及原字体不可映射的 span（CID CFF 无 Unicode cmap）存在字形替换（原始细宋体→标准宋体，笔画略粗，墨迹可增 30%~135%）；未转换 span 复用原字体（TrueType 类），无此问题。
+- **Windows 宋体粗体**：simsun.ttc 无粗体 face，`prepare_fonts.py` 自动下载 Noto Serif CJK SC Bold（OFL）补位；离线/`--no-download` 时粗体降级为常规宋体（视觉变细，不影响正确性）。
 - **横向拉伸丢失**：原始约 2% 的 span 使用非等比横向拉伸（text matrix 1.28× 等，常见于页眉），`insert_text` 不支持非等比缩放，重绘后字距归为正常 em（该行文字变窄约 20%，位置不漂移）。
 - **提取顺序**：个别竖排/表格密集页与原始内容流顺序不同（重建后更符合阅读顺序）。
 - **文件体积**：v1.1 起系统字体预子集化 + ZO 原字体完整嵌入，输出约 12-18MB（v1.0 为 ~60MB）；ZO 原字体不子集化是为保证字形保真。

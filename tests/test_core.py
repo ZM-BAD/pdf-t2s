@@ -24,10 +24,11 @@ FONTS_READY = HAS_DEPS and os.path.exists(
 class TestHelpers(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from scripts import pdf_t2s, verify
+        from scripts import pdf_t2s, prepare_fonts, verify
 
         cls.m = pdf_t2s
         cls.v = verify
+        cls.pf = prepare_fonts
 
     def test_is_cjk(self):
         self.assertTrue(self.m.is_cjk("繁"))
@@ -94,6 +95,13 @@ class TestHelpers(unittest.TestCase):
             self.m.font_key("ZT2S-STSongti-SC-Regular"), "ZT2S-STSongti-SC-Regular"
         )
 
+    def test_default_output(self):
+        # 默认输出命名: 大小写不敏感 .pdf 后缀（Windows 文件系统），无后缀不吞名
+        self.assertEqual(self.m.default_output("x.pdf"), "x_简体.pdf")
+        self.assertEqual(self.m.default_output("X.PDF"), "X_简体.pdf")
+        self.assertEqual(self.m.default_output("dir/a.pdf"), "dir/a_简体.pdf")
+        self.assertEqual(self.m.default_output("noext"), "noext_简体.pdf")
+
     @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
     def test_fallback_font_maps_all_chars(self):
         # 回退字体必须能映射全部字符: '‧'(U+2027) 仅 Songti 有字形
@@ -105,6 +113,68 @@ class TestHelpers(unittest.TestCase):
         rn2, _, fobj2 = self.m.fallback_font(fonts, "MHeiHK", 0, "测试中", True)
         self.assertEqual(rn2, "ZS0")
         self.assertTrue(all(self.m.can_map(fobj2, c) for c in "测试中"))
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_fallback_degrades_missing_bold(self):
+        # 跨平台降级（004）: 粗体槽位缺失 -> 同族常规 face（资源名仍带粗体标志）；
+        # 整族缺失 -> 回退另一族
+        fonts = self.m.load_fonts()
+        self.m._LOADED_PATHS.pop(("cjk", "serif", 16), None)  # 模拟 Windows 无宋体粗体
+        rn, fp, _ = self.m.fallback_font(fonts, "MSungHK", 16, "测试中", True)
+        self.assertEqual(rn, "ZR16")
+        self.assertEqual(fp, self.m.CJK_FONTS[("serif", 0)])
+        self.m._LOADED_PATHS.pop(("cjk", "serif", 0), None)  # 整族缺失 -> sans
+        rn2, fp2, _ = self.m.fallback_font(fonts, "MSungHK", 0, "测试中", True)
+        self.assertEqual(rn2, "ZS0")
+        self.assertEqual(fp2, self.m.CJK_FONTS[("sans", 0)])
+
+    def test_resolve_slot(self):
+        # prepare_fonts 槽位解析: 系统候选优先；下载禁用且无系统字体 -> None
+        # （download_allowed 恒为 False，测试不触发网络）
+        _, path, hint = self.pf.resolve_slot("sans-reg", [("/nope/a.ttc", "sc")], False)
+        self.assertIsNone(path)
+        with tempfile.NamedTemporaryFile(suffix=".ttc") as tf:
+            _, path, hint = self.pf.resolve_slot("sans-reg", [(tf.name, "sc")], False)
+            self.assertEqual(path, tf.name)
+            self.assertEqual(hint, "sc")
+
+    def test_pick_face_by_name(self):
+        # ttc 多 face 按 PS 名（nameID 6）子串选择（不区分大小写），未命中回退 face 0
+
+        class Rec:
+            def __init__(self, s):
+                self.nameID, self._s = 6, s
+
+            def toUnicode(self):
+                return self._s
+
+        class Font:
+            def __init__(self, ps):
+                class NT:
+                    def __init__(self, ps2):
+                        self.names = [Rec(ps2)]
+
+                self.ps = ps
+                self._nt = NT(ps)
+
+            def __getitem__(self, key):
+                return self._nt
+
+        class Coll:
+            def __init__(self, ps_list):
+                self.fonts = [Font(p) for p in ps_list]
+
+        coll = Coll(
+            ["NotoSansCJKjp-Regular", "NotoSansCJKkr-Regular", "NotoSansCJKsc-Regular"]
+        )
+        self.assertEqual(self.pf.pick_face(coll, "sc").ps, "NotoSansCJKsc-Regular")
+        self.assertEqual(
+            self.pf.pick_face(coll, "SC").ps, "NotoSansCJKsc-Regular"
+        )  # 大小写不敏感
+        self.assertEqual(self.pf.pick_face(coll, "nope").ps, "NotoSansCJKjp-Regular")
+        self.assertEqual(
+            self.pf.pick_face(coll, 2).ps, "NotoSansCJKsc-Regular"
+        )  # int 索引
 
     def test_whitelisted_diff(self):
         # 於/于 与标点变体 → 白名单

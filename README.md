@@ -18,16 +18,31 @@
 
 ## 安装
 
+支持 **macOS / Windows / Linux**（Python ≥ 3.10；依赖 PEP 668，必须使用 venv）。
+
 ```sh
-# macOS（Apple Silicon 已验证；依赖 PEP 668，必须使用 venv）
+# macOS / Linux
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python3 scripts/prepare_fonts.py        # 生成重绘用字体
 
-# 生成重绘用字体（从系统字体提取，Apple/微软版权字体不入库）
-.venv/bin/python3 scripts/prepare_fonts.py
+# Windows（PowerShell 或 cmd）
+py -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python scripts\prepare_fonts.py
 ```
 
-> 非 macOS 系统需自行准备 `scripts/t2s-*.ttf`（简体黑体/宋体/Times 各常规+粗体，PS 名以 `ZT2S-` 开头），或修改 `prepare_fonts.py` 中的字体来源。
+`prepare_fonts.py` **系统字体优先**，槽位空缺时自动从开源字体仓库下载补位（Noto CJK SC / Tinos，OFL/Apache 许可）；完全离线的环境加 `--no-download` 禁用下载（缺槽位降级为常规字重）。Linux 建议先安装系统字体包（`apt install fonts-noto-cjk fonts-liberation` / `dnf install google-noto-sans-cjk-fonts fonts-liberation`），则全部走系统字体、零下载。
+
+字体来源（Apple/微软版权字体不入库，均在目标机器由 `prepare_fonts.py` 生成；PS 名加 `ZT2S-` 前缀防与 PDF 原字体撞名）：
+
+| 平台 | 黑体 | 宋体 | Times 类拉丁 |
+|---|---|---|---|
+| macOS | Hiragino Sans GB | Songti SC | Times New Roman |
+| Windows | 微软雅黑（msyh.ttc / msyhbd.ttc） | 宋体 SimSun（simsun.ttc） | Times New Roman（times.ttf） |
+| Linux | Noto Sans CJK SC | Noto Serif CJK SC | Liberation Serif / DejaVu Serif |
+
+> Windows 无原生宋体粗体：`prepare_fonts.py` 自动下载 Noto Serif CJK SC Bold 补位；离线/禁用下载时粗体槽位降级复用常规宋体（粗体 span 视觉变细，不影响正确性）。
 
 ## 使用
 
@@ -45,6 +60,8 @@ python3 -m venv .venv
 .venv/bin/python3 scripts/verify.py 输入.pdf 输出_简体.pdf
 ```
 
+> Windows 用户将命令中的 `.venv/bin/python3` 替换为 `.venv\Scripts\python`；`Makefile` 为 POSIX 开发辅助（macOS/Linux），Windows 直接用上述 python 命令等价执行。
+
 `verify.py` 对原始/输出逐页做五维验证：内容级（字符 multiset 对比，查丢字/漏转）、顺序级（序列比对，参考指标）、字体保真（未转换 span 复用原字体率 ≥ 99%）、像素级（1.0x 墨迹密度对比，查黑块/字体失效）、竖排（字符位置逐点核对），并统计繁体残留特征字，验收判定由脚本末尾输出 ✅/❌。
 
 > 扫描版 PDF（无文本层）**明确不支持**：直接放弃，无 OCR 方案/计划——本工具只处理有文本层的 PDF，扫描版输入请改用其他 OCR 工具。
@@ -56,7 +73,7 @@ python3 -m venv .venv
 ├── scripts/
 │   ├── pdf_t2s.py         # 转换主脚本
 │   ├── verify.py          # 五维验证脚本
-│   └── prepare_fonts.py   # 字体准备（提取 face + ZT2S- 改名）
+│   └── prepare_fonts.py   # 跨平台字体准备（系统优先 + OFL 下载兜底）
 ├── requirements.txt       # pymupdf opencc fonttools
 └── tests/                 # 单元测试（无依赖环境自动跳过）
 ```
@@ -83,6 +100,7 @@ pre-commit 与 CI 均包含 UT、lint、formatter 三关；CI 硬门槛见 `.git
 - 并行转换内存峰值约 2-3GB（进程数 × ~300MB），可用 `--jobs` 调低。
 - 个别标点复制时得到 unicode 变体（页面显示完全一样）。
 - 原始细宋体替换为标准宋体，笔画略粗。
+- Windows 无原生宋体粗体：`prepare_fonts.py` 自动下载 Noto Serif CJK SC Bold 补位；离线/禁用下载时粗体 span 用常规宋体渲染（视觉变细）。
 
 ## License
 

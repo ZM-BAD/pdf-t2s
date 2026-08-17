@@ -25,6 +25,7 @@
 import argparse
 import multiprocessing as mp
 import os
+import sys
 import tempfile
 import time
 
@@ -54,14 +55,37 @@ LATIN_SERIF = {
 BOLD_FLAG = 16
 # 可子集化的系统字体路径集（原 PDF 内嵌字体 ZO 不在此列，保持完整嵌入）
 SYSTEM_FONT_PATHS = set(CJK_FONTS.values()) | set(LATIN_SERIF.values())
+# 已加载的系统字体槽位: {fonts 字典键: 路径}，由 load_fonts 填充。
+# 跨平台（004）: prepare_fonts 可能缺槽位（如 Windows 无原生宋体粗体），
+# 字体选择只在已加载槽位中进行，缺失槽位按 bold→常规、同族→异族降级。
+_LOADED_PATHS = {}
 
 
 def load_fonts():
+    """加载系统字体（跨平台降级）: 缺失的槽位跳过并警告，不中断。
+    全部缺失时也不抛异常——未转换文档仍可转换（原字体复用路径不依赖系统字体）。"""
     fonts = {}
+    _LOADED_PATHS.clear()
     for (kind, bold), path in CJK_FONTS.items():
-        fonts[("cjk", kind, bold)] = fitz.Font(fontfile=path)
+        key = ("cjk", kind, bold)
+        if not os.path.exists(path):
+            print(
+                f"  ⚠ 缺少字体 {os.path.basename(path)}（{kind}，粗体={bold}）——将降级/回退",
+                flush=True,
+            )
+            continue
+        fonts[key] = fitz.Font(fontfile=path)
+        _LOADED_PATHS[key] = path
     for bold, path in LATIN_SERIF.items():
-        fonts[("latin_serif", bold)] = fitz.Font(fontfile=path)
+        key = ("latin_serif", bold)
+        if not os.path.exists(path):
+            print(
+                f"  ⚠ 缺少字体 {os.path.basename(path)}（拉丁宋体，粗体={bold}）——将降级/回退",
+                flush=True,
+            )
+            continue
+        fonts[key] = fitz.Font(fontfile=path)
+        _LOADED_PATHS[key] = path
     for key, f in fonts.items():
         print(f"  字体 {key}: {f.name}", flush=True)
     return fonts
@@ -183,30 +207,43 @@ def original_font(fname, doc_fonts):
 
 def fallback_font(fonts, fname, bold, new, has_cjk):
     """系统字体回退: 返回 (资源名, 文件路径, 字体对象)，选择第一个能映射
-    `new` 全部字符的字体（无命中用首选）。原字体不可提取/不可映射的
-    未转换 span，以及转换过的 span，都经此选择——保证字形可渲染、提取不丢。"""
+    `new` 全部字符的已加载字体（无命中用首选）。原字体不可提取/不可映射的
+    未转换 span，以及转换过的 span，都经此选择——保证字形可渲染、提取不丢。
+    跨平台降级（004）: 只从 _LOADED_PATHS 中的槽位选择——粗体槽位缺失时
+    降级同族常规（bold→0），整族缺失时降级另一族；全部缺失给出明确错误。"""
     kind = font_kind(fname)
-    cands = []
+    other = "sans" if kind == "serif" else "serif"
     if has_cjk:
-        cands.append(("S" if kind == "sans" else "R", kind))
-        other = "sans" if kind == "serif" else "serif"
-        cands.append(("S" if other == "sans" else "R", other))
+        cands = [
+            (("S" if k == "sans" else "R"), k, b)
+            for k in (kind, other)
+            for b in (bold, 0)
+        ]
     else:
-        if "Times" in fname:
-            cands.append(("T", "latin"))
-        cands.append(("S", "sans"))
-        cands.append(("R", "serif"))
-    for tag, k2 in cands:
-        if k2 == "latin":
-            fp, fobj = LATIN_SERIF[bold], fonts[("latin_serif", bold)]
-        else:
-            fp, fobj = CJK_FONTS[(k2, bold)], fonts[("cjk", k2, bold)]
-        if all(can_map(fobj, c) for c in new):
-            return f"Z{tag}{bold}", fp, fobj
-    tag, k2 = cands[0]
-    if k2 == "latin":
-        return f"Z{tag}{bold}", LATIN_SERIF[bold], fonts[("latin_serif", bold)]
-    return f"Z{tag}{bold}", CJK_FONTS[(k2, bold)], fonts[("cjk", k2, bold)]
+        # 与原版一致: 仅 Times 类字体尝试拉丁 Times 槽位，其余纯拉丁走 sans/serif
+        cands = [("T", "latin", b) for b in (bold, 0)] if "Times" in fname else []
+        cands += [
+            (("S" if k == "sans" else "R"), k, b)
+            for k in ("sans", "serif")
+            for b in (bold, 0)
+        ]
+    first = None
+    for tag, k2, b2 in cands:
+        key = ("latin_serif", b2) if k2 == "latin" else ("cjk", k2, b2)
+        if key not in _LOADED_PATHS:
+            continue
+        if first is None:
+            first = key
+        if all(can_map(fonts[key], c) for c in new):
+            return f"Z{tag}{bold}", _LOADED_PATHS[key], fonts[key]
+    if first is not None:
+        k2 = "latin" if first[0] == "latin_serif" else first[1]
+        tag = {"latin": "T", "sans": "S", "serif": "R"}[k2]
+        return f"Z{tag}{bold}", _LOADED_PATHS[first], fonts[first]
+    raise RuntimeError(
+        "未找到任何 t2s-*.ttf 系统字体（scripts/ 目录）——"
+        "请先运行 scripts/prepare_fonts.py 生成字体后再转换"
+    )
 
 
 def sys_font(fonts, fname, bold):
@@ -467,14 +504,16 @@ def process_pdf(src, cc, fonts, out=None):
                 flush=True,
             )
     if out is None:
-        out = src.rsplit(".pdf", 1)[0] + "_简体.pdf"
+        out = default_output(src)
     # 注意: 不使用 doc.subset_fonts()（ToUnicode 生成对部分字体映射错误，导致
     # "财务资料"等提取成控制字符）；体积由 fontTools 预子集化控制（见上）
     n_purged = purge_unused_fonts(doc)
     if n_purged:
         print(f"  清理未引用字体条目 {n_purged} 个", flush=True)
-    doc.save(out, garbage=3, deflate=True)
-    doc.close()
+    try:
+        save_output(doc, out, garbage=3, deflate=True)
+    finally:
+        doc.close()  # 保存失败也释放句柄（Windows 批量转换防文件占用）
     size_mb = os.path.getsize(out) / 1024 / 1024
     print(
         f"完成 {os.path.basename(src)} -> {os.path.basename(out)} "
@@ -483,6 +522,26 @@ def process_pdf(src, cc, fonts, out=None):
         flush=True,
     )
     return out
+
+
+def default_output(src):
+    """默认输出路径: <原名>_简体.pdf（大小写不敏感的 .pdf 后缀，Windows 兼容）"""
+    root, ext = os.path.splitext(src)
+    if ext.lower() != ".pdf":
+        root = src
+    return root + "_简体.pdf"
+
+
+def save_output(doc, out, **kwargs):
+    """保存输出；目标文件被占用/只读（Windows 常见 PermissionError）时报清晰错误"""
+    try:
+        doc.save(out, **kwargs)
+    except OSError as e:
+        raise RuntimeError(
+            f"无法写入输出文件 {out}: {e}。"
+            "若文件已存在，请先关闭占用它的程序（如 PDF 阅读器），"
+            "或改用 --output 指定其他路径"
+        ) from e
 
 
 def dedup_fonts(doc):
@@ -614,9 +673,11 @@ def process_pdf_parallel(src, cc, fonts, out=None, jobs=None):
     if n_purged:
         print(f"  清理未引用字体条目 {n_purged} 个", flush=True)
     if out is None:
-        out = src.rsplit(".pdf", 1)[0] + "_简体.pdf"
-    merged.save(out, garbage=3, deflate=True, deflate_fonts=True)
-    merged.close()
+        out = default_output(src)
+    try:
+        save_output(merged, out, garbage=3, deflate=True, deflate_fonts=True)
+    finally:
+        merged.close()  # 保存失败也释放句柄（Windows 批量转换防文件占用）
     size_mb = os.path.getsize(out) / 1024 / 1024
     print(
         f"完成 {os.path.basename(src)} -> {os.path.basename(out)} "
@@ -628,6 +689,12 @@ def process_pdf_parallel(src, cc, fonts, out=None, jobs=None):
 
 
 def main():
+    # Windows 上 stdout 重定向（管道/CI 日志）时用 locale 编码会中文乱码/报错
+    # （Python 3.15 起默认 UTF-8，此处兼容 3.10-3.14）
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="繁体 PDF → 简体 PDF（保留原排版，本地处理）"
     )
@@ -651,7 +718,10 @@ def main():
         if not os.path.exists(src):
             print(f"跳过（不存在）: {src}", flush=True)
             continue
-        process_pdf_parallel(src, cc, fonts, out=args.output, jobs=args.jobs)
+        try:
+            process_pdf_parallel(src, cc, fonts, out=args.output, jobs=args.jobs)
+        except (RuntimeError, OSError) as e:  # 单文件失败不中断批量
+            print(f"转换失败 {src}: {e}", flush=True)
 
 
 if __name__ == "__main__":

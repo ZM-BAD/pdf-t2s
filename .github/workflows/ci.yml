@@ -1,5 +1,8 @@
 # Quality gates (hard): UT + lint + format.
 # 依赖与版本声明: pyproject.toml (dev extra) / uv.lock 为准，此处锁定一致。
+# 三平台矩阵（004 跨平台）: 每平台跑 prepare_fonts（系统字体 + OFL 下载兜底）后
+# 全量 pytest——字体相关测试（8 个）不再 SKIP，spawn 并行/Windows 字体源/Noto 路径
+# 均被真实验证。opencc 冒烟防 Linux 共享库缺失（旧版 wheel 的坑）。
 name: ci
 
 on:
@@ -27,16 +30,26 @@ jobs:
         run: ruff format --check .
 
   test:
-    name: unit tests (pytest)
-    runs-on: ubuntu-latest
+    name: unit tests (pytest) on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.14"
+      - name: Install Linux CJK/Liberation fonts
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-liberation
       - run: pip install -r requirements.txt pytest==9.1.1
-      # scripts/t2s-*.ttf 为版权字体（prepare_fonts.py 从 macOS 系统字体提取），
-      # 不入库，CI 上 8 个字体相关测试会 SKIP（13 passed, 8 skipped）；
-      # 完整 21 个测试在本地 venv 全量运行（make test）。-rs 打印跳过原因。
-      - name: pytest
+      - name: opencc smoke (bundled lib check)
+        run: python -c "import opencc; assert opencc.OpenCC('t2s').convert('繁體') == '繁体'"
+      - name: Prepare fonts (platform sources + OFL download fallback)
+        run: python scripts/prepare_fonts.py
+      - name: pytest (full suite incl. font-dependent tests)
+        env:
+          PYTHONUTF8: "1" # Windows 管道输出 UTF-8，防中文日志编码报错
         run: python -m pytest -q -rs

@@ -16,6 +16,7 @@
 import argparse
 import os
 import re
+import sys
 from collections import Counter
 from difflib import SequenceMatcher
 
@@ -320,6 +321,11 @@ def check_pair(src, dst):
 
 
 def main():
+    # Windows 上 stdout 重定向（管道/CI 日志）时用 locale 编码会中文乱码/报错
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="验证 pdf_t2s.py 的转换结果（五维验证）"
     )
@@ -331,7 +337,7 @@ def main():
         parser.error("参数必须是成对的 <原始.pdf> <输出_简体.pdf>")
     for i in range(0, len(args.pairs), 2):
         src, dst = args.pairs[i], args.pairs[i + 1]
-        print(f"=== {src.split('/')[-1]}", flush=True)
+        print(f"=== {os.path.basename(src)}", flush=True)
         try:
             check_pair(src, dst)
         except Exception as e:  # noqa: BLE001 — 逐对隔离错误，全部验完再退出
