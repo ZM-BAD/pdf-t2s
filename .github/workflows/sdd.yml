@@ -1,10 +1,11 @@
 # SDD gate installed by spooner transform Stage 4 (optional):
 # spec files must exist — deleting them fails CI on purpose
+# 所有分支全量运行（含分支 push），与 ci.yml 一致
 name: sdd
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 

@@ -16,6 +16,17 @@ HAS_DEPS = all(importlib.util.find_spec(m) for m in ("fitz", "opencc"))
 FONTS_READY = HAS_DEPS and os.path.exists(
     os.path.join(os.path.dirname(__file__), "..", "scripts", "t2s-serif-regular.ttf")
 )
+ALL_FONTS_READY = HAS_DEPS and all(
+    os.path.exists(os.path.join(os.path.dirname(__file__), "..", "scripts", n))
+    for n in (
+        "t2s-sans-regular.ttf",
+        "t2s-sans-bold.ttf",
+        "t2s-serif-regular.ttf",
+        "t2s-serif-bold.ttf",
+        "t2s-times.ttf",
+        "t2s-times-bold.ttf",
+    )
+)
 
 
 @unittest.skipUnless(
@@ -102,14 +113,26 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(self.m.default_output("dir/a.pdf"), "dir/a_简体.pdf")
         self.assertEqual(self.m.default_output("noext"), "noext_简体.pdf")
 
+    @unittest.skipUnless(os.environ.get("PDF_T2S_CI"), "仅 CI 运行")
+    def test_ci_fonts_ready(self):
+        # CI 门禁（004 review）: prepare_fonts 未产出全部 6 个字体槽位时禁止
+        # 字体测试静默 SKIP 让 CI 照样绿——字体缺失必须显式失败
+        self.assertTrue(
+            ALL_FONTS_READY,
+            "CI 门禁: scripts/ 下 t2s-*.ttf 不全（prepare_fonts 未产出 6 个槽位）——"
+            "检查该平台 prepare_fonts 步骤的日志",
+        )
+
     @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
     def test_fallback_font_maps_all_chars(self):
-        # 回退字体必须能映射全部字符: '‧'(U+2027) 仅 Songti 有字形
+        # 回退字体必须能映射全部字符。'‧'(U+2027) 的落位取决于平台字体覆盖:
+        # macOS 上 Times/Hiragino 无此字形 → 宋体(ZR0)；Linux 上 Noto Sans 也有
+        # 此字形 → ZS0。断言性质（必能映射、槽位合法）而非具体槽位。
         fonts = self.m.load_fonts()
         rn, _, fobj = self.m.fallback_font(fonts, "MSungHK-Light", 0, "‧", False)
-        self.assertEqual(rn, "ZR0")  # Times/Hiragino 无此字形 → 落到 Songti
+        self.assertIn(rn, ("ZR0", "ZS0"), f"回退槽位异常: {rn}")
         self.assertTrue(self.m.can_map(fobj, "‧"))
-        # 含 CJK 的回退按黑体/宋体类，且必能映射
+        # 含 CJK 的回退按黑体/宋体类（sans 原字体 → sans 槽位），且必能映射
         rn2, _, fobj2 = self.m.fallback_font(fonts, "MHeiHK", 0, "测试中", True)
         self.assertEqual(rn2, "ZS0")
         self.assertTrue(all(self.m.can_map(fobj2, c) for c in "测试中"))
@@ -119,14 +142,19 @@ class TestHelpers(unittest.TestCase):
         # 跨平台降级（004）: 粗体槽位缺失 -> 同族常规 face（资源名仍带粗体标志）；
         # 整族缺失 -> 回退另一族
         fonts = self.m.load_fonts()
-        self.m._LOADED_PATHS.pop(("cjk", "serif", 16), None)  # 模拟 Windows 无宋体粗体
-        rn, fp, _ = self.m.fallback_font(fonts, "MSungHK", 16, "测试中", True)
-        self.assertEqual(rn, "ZR16")
-        self.assertEqual(fp, self.m.CJK_FONTS[("serif", 0)])
-        self.m._LOADED_PATHS.pop(("cjk", "serif", 0), None)  # 整族缺失 -> sans
-        rn2, fp2, _ = self.m.fallback_font(fonts, "MSungHK", 0, "测试中", True)
-        self.assertEqual(rn2, "ZS0")
-        self.assertEqual(fp2, self.m.CJK_FONTS[("sans", 0)])
+        try:
+            self.m._LOADED_PATHS.pop(
+                ("cjk", "serif", 16), None
+            )  # 模拟 Windows 无宋体粗体
+            rn, fp, _ = self.m.fallback_font(fonts, "MSungHK", 16, "测试中", True)
+            self.assertEqual(rn, "ZR16")
+            self.assertEqual(fp, self.m.CJK_FONTS[("serif", 0)])
+            self.m._LOADED_PATHS.pop(("cjk", "serif", 0), None)  # 整族缺失 -> sans
+            rn2, fp2, _ = self.m.fallback_font(fonts, "MSungHK", 0, "测试中", True)
+            self.assertEqual(rn2, "ZS0")
+            self.assertEqual(fp2, self.m.CJK_FONTS[("sans", 0)])
+        finally:
+            self.m.load_fonts()  # 恢复 _LOADED_PATHS 模块全局状态（断言失败也要恢复）
 
     def test_resolve_slot(self):
         # prepare_fonts 槽位解析: 系统候选优先；下载禁用且无系统字体 -> None
@@ -221,9 +249,12 @@ class TestHelpers(unittest.TestCase):
 
         doc = fitz.open()
         page = doc.new_page()
+        # 未转换 span 文本不能含 年 等有兼容区码点（U+F98E）的字——Noto 系字体
+        # 经 MuPDF 提取会把 年 映射为 年，OpenCC 归一化后 span 被判为"已转换"，
+        # 复用断言失效（004 跨平台，input 字体派生自平台 t2s-serif-regular）
         page.insert_text(
-            (72, 72), "2021年12月2日", fontname="F0", fontfile=renamed, fontsize=12
-        )  # 同形字，转换前后相同
+            (72, 72), "测试20211202", fontname="F0", fontfile=renamed, fontsize=12
+        )  # 同形字，转换前后相同（避开 U+2011 连字符与 U+F98E 兼容区映射怪癖）
         page.insert_text(
             (72, 92), "繁體字測試", fontname="F0", fontfile=renamed, fontsize=12
         )  # 会转换
@@ -256,14 +287,17 @@ class TestHelpers(unittest.TestCase):
                     if t.strip():
                         out_fonts[t] = s["font"].split("+")[-1]
         self.assertEqual(
-            out_fonts.get("2021年12月2日"),
+            out_fonts.get("测试20211202"),
             "TestOrigSerif",
             "未转换 span 必须复用原 PDF 字体",
         )
-        self.assertEqual(
-            out_fonts.get("繁体字测试"),
-            "ZT2S-STSongti-SC-Regular",
-            "转换 span 必须用系统简体字体",
+        # 转换 span 的系统字体 PS 名因平台而异（Songti/Noto Serif/SimSun），
+        # 只断言 ZT2S- 前缀；用子串匹配防提取分 span
+        changed = {f for t, f in out_fonts.items() if "繁体字测试" in t}
+        self.assertTrue(changed, f"未找到转换后的 span: {list(out_fonts)}")
+        self.assertTrue(
+            all(f.startswith("ZT2S-") for f in changed),
+            f"转换 span 必须用系统简体字体（ZT2S- 前缀）: {changed}",
         )
         doc.close()
 
@@ -375,13 +409,13 @@ class TestHelpers(unittest.TestCase):
 
         serif = pdf_t2s.CJK_FONTS[("serif", 0)]
         # 字符集必须是转换后文本（重绘字符）；若给原始繁体字符集会缺 体/测/试 字形
-        mapping = pdf_t2s.subset_system_fonts({serif: set("繁体字测试")})
+        mapping = pdf_t2s.subset_system_fonts({serif: set("繁体字测试2021年")})
         self.assertIn(serif, mapping)
 
         doc = fitz.open()
         page = doc.new_page()
         page.insert_text(
-            (72, 72), "繁體字測試", fontname="F0", fontfile=serif, fontsize=12
+            (72, 72), "繁體字測試2021年", fontname="F0", fontfile=serif, fontsize=12
         )
         cc = opencc.OpenCC("t2s")
         fonts = pdf_t2s.load_fonts()
@@ -395,7 +429,12 @@ class TestHelpers(unittest.TestCase):
         d2.close()
         ctrl = sorted({c for c in got if ord(c) < 32 and c not in "\n\r\t"})
         self.assertEqual(ctrl, [], f"子集字体嵌入后提取出控制字符: {ctrl}")
-        self.assertEqual(self.v.norm(got), "繁体字测试", f"提取文本不符: {got!r}")
+        self.assertEqual(self.v.norm(got), "繁体字测试2021年", f"提取文本不符: {got!r}")
+        # 回归（004 跨平台）: Noto 系字体未子集化时 MuPDF 会把 年 映射为兼容区
+        # U+F98E（提取变 年，OpenCC 归一化后误判"已转换"）；子集化剪掉兼容区
+        # 映射后必须仍是常规码点——Linux 生产路径（先子集化再重绘）的保障
+        compat = [hex(ord(c)) for c in got if 0xF900 <= ord(c) <= 0xFAFF]
+        self.assertEqual(compat, [], f"子集重绘后出现兼容区码点: {compat}")
         # 体积: 子集嵌入应远小于完整 serif (20MB)
         self.assertLess(os.path.getsize(out) / 1e6, 1.0, f"子集嵌入体积过大: {out}")
 

@@ -35,7 +35,7 @@ import sys
 import tempfile
 import urllib.request
 
-from fontTools.ttLib import TTCollection, TTFont
+from fontTools.ttLib import TTCollection, TTFont, TTLibError
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PS_PREFIX = "ZT2S-"
@@ -195,18 +195,29 @@ def fc_file(pattern):
 
 
 def pick_face(collection, hint):
-    """从 ttc 按 PS 名（nameID 6）选 face，未命中回退 face 0。
-    hint 为 int 时按索引（macOS 遗留已验证索引）；为 str 时按子串匹配，
-    但子串必须收尾在边界（- 或结尾）——否则 "sc" 会误中所有 Noto face 的
-    "NotoS**ans**CJK" 内部子串（jp/kr/tc/hk 全命中），选错 region face。"""
+    """从 ttc 按 PS 名（nameID 6）选 face，未命中回退 face 0（附警告）。
+    hint 为 int 时按索引（macOS 遗留已验证索引）；为 str 时先精确匹配 PS 名
+    （防 "SimSun" 被 "NSimSun" 抢先——子串匹配在 ttc face 顺序变化时不稳），
+    再按边界子串匹配——子串必须收尾在边界（- 或结尾），否则 "sc" 会误中所有
+    Noto face 的 "NotoS**ans**CJK" 内部子串（jp/kr/tc/hk 全命中），选错 region face。"""
     if isinstance(hint, int):
         return collection.fonts[hint]
     if isinstance(hint, str):
-        pattern = re.compile(re.escape(hint.lower()) + r"(?:-|$|\b)")
+        exact = hint.lower()
+        pattern = re.compile(re.escape(exact) + r"(?:-|$|\b)")
+        for font in collection.fonts:
+            for record in font["name"].names:
+                if record.nameID == 6 and record.toUnicode().lower() == exact:
+                    return font
         for font in collection.fonts:
             for record in font["name"].names:
                 if record.nameID == 6 and pattern.search(record.toUnicode().lower()):
                     return font
+        print(
+            f"  ⚠ face hint {hint!r} 未命中任何 face，回退 face 0"
+            "（字形可能非目标 region）",
+            flush=True,
+        )
     return collection.fonts[0]
 
 
@@ -226,7 +237,11 @@ def download(url):
         return _download_cache[url]
     tmp = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pdf-t2s"})
+        # Accept 头必须带——GitHub 对无 Accept 的请求返回 404（边缘节点行为，
+        # curl 默认带 */* 而 urllib 默认不带；实测缺此头必 404）
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "pdf-t2s", "Accept": "*/*"}
+        )
         with urllib.request.urlopen(req, timeout=60) as resp:
             fd, tmp = tempfile.mkstemp(prefix="pdf-t2s-dl-", suffix=".bin")
             with os.fdopen(fd, "wb") as fh:
@@ -254,11 +269,14 @@ def resolve_slot(key, candidates, download_allowed):
 
 def extract_and_save(src_path, hint, out_path):
     """提取 face（ttc 按 hint 选 face）→ PS 名加 ZT2S- 前缀 → 保存。
-    返回 PS 名变化描述。"""
+    返回 PS 名变化描述。fc-match 可能返回单 face 文件（非 ttc），容错为单字体。"""
     if hint is None:
         font = TTFont(src_path)
     else:
-        font = pick_face(TTCollection(src_path), hint)
+        try:
+            font = pick_face(TTCollection(src_path), hint)
+        except TTLibError:  # 单 face 文件（非 ttc）按 TTFont 处理
+            font = TTFont(src_path)
     before = [r.toUnicode() for r in font["name"].names if r.nameID == 6][:1]
     rename_ps_name(font)
     after = [r.toUnicode() for r in font["name"].names if r.nameID == 6][:1]
@@ -267,6 +285,11 @@ def extract_and_save(src_path, hint, out_path):
 
 
 def main():
+    # Windows 上 stdout 重定向（管道/CI 日志）时用 locale 编码会中文乱码/报错
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="从系统字体提取 pdf_t2s 所需的中文字体（macOS/Windows/Linux）"
     )
@@ -286,7 +309,8 @@ def main():
     for out_name, key, desc in SLOTS:
         src_desc, src_path, hint = resolve_slot(key, sources[key], not args.no_download)
         if src_path is None:
-            print(f"  {desc}: !! 无系统字体且下载不可用，槽位空缺", flush=True)
+            # 下载禁用或下载失败（download() 已打印具体原因）
+            print(f"  {desc}: !! 槽位空缺（无系统字体，且下载禁用或失败）", flush=True)
             continue
         out = os.path.join(args.out_dir, out_name)
         try:
@@ -294,6 +318,26 @@ def main():
             ok.add(key)
             print(f"  {desc}: {src_desc}（{ps_note}）-> {out_name}", flush=True)
         except Exception as e:  # noqa: BLE001 — 单槽位失败不中断，走降级
+            if not args.no_download and src_desc and src_desc.startswith("系统字体"):
+                # 系统字体文件存在但损坏/不可读: 绕过候选直接走下载兜底
+                # （resolve_slot 会再次命中损坏路径，不能重试候选列表）
+                dl_url, dl_desc = DOWNLOAD_SOURCES[key]
+                dl_path = download(dl_url)
+                if dl_path:
+                    try:
+                        ps_note = extract_and_save(dl_path, None, out)
+                        ok.add(key)
+                        print(
+                            f"  {desc}: 系统字体损坏，改用下载 {dl_desc}"
+                            f"（{ps_note}）-> {out_name}",
+                            flush=True,
+                        )
+                        continue
+                    except Exception as dl_e:  # noqa: BLE001 — 下载兜底也失败
+                        print(
+                            f"    ! 下载兜底 {dl_desc} 也提取失败（{dl_e}）",
+                            flush=True,
+                        )
             print(f"  {desc}: !! 提取失败（{e}），槽位空缺", flush=True)
     # 降级: 粗体槽位复用同风格常规 face（视觉降级，保证 6 文件齐全）
     for bold_key, reg_key in BOLD_FALLBACK.items():
@@ -318,6 +362,9 @@ def main():
             "（Linux: fonts-noto-cjk + fonts-liberation）或启用下载（去掉 --no-download）",
             flush=True,
         )
+    # 一个字体都没产出视为失败（退出码 1，供 CI/脚本检测）；部分降级（如
+    # 粗体复用常规）是既定设计，仍为成功
+    return 1 if not ok else 0
 
 
 def slot_file(key):

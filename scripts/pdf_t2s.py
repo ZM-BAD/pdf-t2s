@@ -213,19 +213,22 @@ def fallback_font(fonts, fname, bold, new, has_cjk):
     降级同族常规（bold→0），整族缺失时降级另一族；全部缺失给出明确错误。"""
     kind = font_kind(fname)
     other = "sans" if kind == "serif" else "serif"
+    # 候选顺序（保持与原版一致 + 降级追加项）: 每个族内 粗体→常规（bold 为 0 时
+    # 去重），族间 同族→异族。全量加载时与原版行为等价——同族粗/常规字形覆盖
+    # 相同，映射选择不会发散（504 页基线吻合）；粗体缺失时同族常规先于异族
+    # 粗体（视觉降级更小）。
+    b_vals = (bold,) if bold == 0 else (bold, 0)
     if has_cjk:
         cands = [
-            (("S" if k == "sans" else "R"), k, b)
-            for k in (kind, other)
-            for b in (bold, 0)
+            (("S" if k == "sans" else "R"), k, b) for k in (kind, other) for b in b_vals
         ]
     else:
         # 与原版一致: 仅 Times 类字体尝试拉丁 Times 槽位，其余纯拉丁走 sans/serif
-        cands = [("T", "latin", b) for b in (bold, 0)] if "Times" in fname else []
+        cands = [("T", "latin", b) for b in b_vals] if "Times" in fname else []
         cands += [
             (("S" if k == "sans" else "R"), k, b)
             for k in ("sans", "serif")
-            for b in (bold, 0)
+            for b in b_vals
         ]
     first = None
     for tag, k2, b2 in cands:
@@ -246,6 +249,10 @@ def fallback_font(fonts, fname, bold, new, has_cjk):
     )
 
 
+# 资源名约定函数（ZS/ZR/ZT + 粗体标志，见 SKILL.md 字体映射表）——仅测试
+# 引用（test_font_resource_names）作为命名约定锚点；转换路径走 pick_font/
+# fallback_font（带缺槽位降级）。注意: 二者直接索引 CJK_FONTS/LATIN_SERIF，
+# 无降级保护，生产代码不应调用。
 def sys_font(fonts, fname, bold):
     """系统字体 -> (资源名, 文件路径)"""
     kind = font_kind(fname)
@@ -714,6 +721,7 @@ def main():
         parser.error("--output 仅支持单个输入文件")
     cc = opencc.OpenCC("t2s")
     fonts = load_fonts()
+    failures = 0
     for src in args.srcs:
         if not os.path.exists(src):
             print(f"跳过（不存在）: {src}", flush=True)
@@ -721,8 +729,10 @@ def main():
         try:
             process_pdf_parallel(src, cc, fonts, out=args.output, jobs=args.jobs)
         except (RuntimeError, OSError) as e:  # 单文件失败不中断批量
+            failures += 1
             print(f"转换失败 {src}: {e}", flush=True)
+    return 1 if failures else 0  # 全部失败时退出码必须非 0（review 004）
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

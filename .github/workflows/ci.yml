@@ -1,13 +1,16 @@
 # Quality gates (hard): UT + lint + format.
 # 依赖与版本声明: pyproject.toml (dev extra) / uv.lock 为准，此处锁定一致。
 # 三平台矩阵（004 跨平台）: 每平台跑 prepare_fonts（系统字体 + OFL 下载兜底）后
-# 全量 pytest——字体相关测试（8 个）不再 SKIP，spawn 并行/Windows 字体源/Noto 路径
-# 均被真实验证。opencc 冒烟防 Linux 共享库缺失（旧版 wheel 的坑）。
+# 全量 pytest——9 个字体相关测试不再 SKIP（PDF_T2S_CI=1 时字体缺失会硬失败，
+# 禁止静默跳过），spawn 并行/Windows 字体源/Noto 路径均被真实验证。
+# opencc 冒烟防 Linux 共享库缺失（旧版 wheel 的坑）。
+# 所有分支全量运行（含分支 push）——合并进 main 前分支上就必须全绿，
+# main 上的运行只是兜底。
 name: ci
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -52,4 +55,5 @@ jobs:
       - name: pytest (full suite incl. font-dependent tests)
         env:
           PYTHONUTF8: "1" # Windows 管道输出 UTF-8，防中文日志编码报错
+          PDF_T2S_CI: "1" # 字体缺失时硬失败（禁止 SKIP 静默通过）
         run: python -m pytest -q -rs
