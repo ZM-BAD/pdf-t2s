@@ -58,9 +58,18 @@ date: 2026-08-14
 
 **原字体匹配规则**：`load_doc_fonts` 以 basefont 的 **PostScript 名去除 subset 前缀后**为键（`SPNAJD+MHeiHK-Bold` → `MHeiHK-Bold`），**按页匹配该页实际引用的子集字体**（同 PS 名不同子集时以页为准，保证字形必然存在）；span 字体名同样去除前缀后匹配。子集字体与 span 字体名由此归一，未转换 span 一律按上表复用原字体——**含 CJK 的未转换 span 同样复用原字体**（原字体渲染过这些字形，字形必然存在；系统字体仅用于转换过或原字体不可用的 span）。
 
+**截断名前缀回退（004 fix）**：MuPDF rawdict 把超长 span 字体名截断到 24 字符（实测：`TimesNewRomanPS-BoldItalicMT` → `TimesNewRomanPS-BoldItal`、`MicrosoftJhengHeiRegular-ETen-B5-H` → `MicrosoftJhengHeiRegular`），而 `load_doc_fonts` 的键是完整 BaseFont 名。精确匹配失败时按 24 字符前缀回退完整名（`find_doc_font`）——否则真斜体等长名字体会查键失败回退系统正体字体，斜体丢失（MiniMax 第 159 页 `TimesNewRomanPS-BoldItalicMT` 实测受影响）。
+
 **可映射探测**：复用原字体前逐字符 `fitz.Font.has_glyph` 探测 Unicode→字形映射可用性（结果按 字符×字体 缓存）。CID CFF 等无 Unicode cmap 的字体（如 SourceHanSans、MSungHK）探测失败，`insert_text` 无法为其做 Unicode→字形映射（复用会导致 notdef 与提取 \x00），一律回退系统字体；TrueType 等带 cmap 的字体（TimesLTStd、Arial）正常复用。
 
-**宽度收缩**：以**实际绘制字体**度量新文本宽度；`fit_w > bbox.width × 1.02` 时 `size = max(size × bbox.width / fit_w, size × 0.6)`。未转换 span 使用原字体时度量与原始一致，不触发收缩。
+**宽度拟合**（004 fix 双向化）：以**实际绘制字体**度量新文本宽度，仅系统字体路径（ZO 原字体度量与原始一致，跳过）：
+
+- 收缩（原有）：`fit_w > bbox.width × 1.02` 时 `size = max(size × bbox.width / fit_w, size × 0.6)`
+- 放大（004 fix）：`fit_w < bbox.width × 0.98` 时 `size = min(size × bbox.width / fit_w, size × 1.5)`——回退字体更窄（如 MSungHK 字形墨迹 1.107em 而 Songti 1.0em）时补足视觉宽度，否则行尾缩短、字距视觉变紧
+
+**粗体档位检测（004 fix）**：MuPDF 的 span 粗体位（flags bit 4）只对名字含 'Bold' 的字体设位——'Xbold'/'Heavy'/'Black' 等加粗档位不设位（MHeiHK-Xbold、SourceHanSansCN-Heavy 实测），粗体 span 会回退常规字重。`_span_bold` 以名字级正则（`X?Bold|Heavy|Black`）补充检测；返回值必须为 0/16 整数（`fallback_font` 用其拼接资源名 ZS0/ZS16 并索引槽位键——布尔 True 会产出 ZSTrue/ZSFalse 资源名且查不到粗体槽位）。
+
+**斜体保真（004 fix）**：原 PDF 的"假斜体"——字体文件本身正体（如内嵌 `Times-Roman Regular`、`TimesLTStd-Roman`），靠 FontDescriptor /Flags 斜体位（bit 5 = 32）声明斜体，查看器（Chrome/pdfium、Foxit、Acrobat 等理会标志者；MuPDF/Quartz 渲染忽略该位）据此合成倾斜。`insert_text` 重绘创建的新字体对象不带该位（Flags 由字体文件派生），假斜体会在理会标志的查看器中消失。修复：重绘时按页收集原字体描述符斜体位（`_descriptor_flags`，支持简单字体直链与 Type0/CID 的 DescendantFonts 内嵌描述符），`apply_italic_flags` 在页面 commit 后把该位补到对应新字体对象。真斜体（字形本身倾斜的字体文件，如 `TimesNewRomanPS-BoldItalicMT`）经 ZO 复用天然保留。
 
 ## 验证门槛（五维，`scripts/verify.py`）
 
@@ -70,6 +79,7 @@ date: 2026-08-14
 | 顺序级 | SequenceMatcher ratio | 参考指标，不以一致为目标（输出 = 视觉阅读序） |
 | 字体保真 | 未转换 span 逐 span 核对输出字体 = 原字体（去前缀 PS 名） | 原字体可提取且可映射的 span ≥ 99% 复用；回退计入报告 |
 | 像素级 | 1.0x 渲染墨迹密度差（抽样 ≥20 页，含全部竖排页与收缩页） | ≤ 0.02 |
+| 网格级（004 fix） | 12×10 格子墨迹对比（整页渲染；原墨迹 >250px 且损失 >75% 判异常） | 0 异常（回归检测——整页密度对局部缺失不敏感；既有的不可提取文字/竖排偏移损失 <250px 排除，见 SKILL.md 已知限制） |
 | 竖排 | 字符位置逐点核对 + 列内提取顺序 | 0 缺失，自上而下 |
 
 白名单（内容级允许差异）：`於→于` 补丁差异、标点 unicode 变体（`-`↔`\xad`、`•`↔`・`、`…`↔`⋯`，页面显示一致）、原始 PDF 固有乱码页（安永信信头 2 页）。

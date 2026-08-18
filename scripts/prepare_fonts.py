@@ -26,6 +26,7 @@
 """
 
 import argparse
+import atexit
 import os
 import platform
 import re
@@ -104,8 +105,8 @@ BOLD_FALLBACK = {
 
 def platform_sources():
     """按平台返回系统字体候选: {槽位: [(路径, face_hint)]}
-    face_hint: None=单 face 文件；str=按 PS 名子串选 face（不区分大小写）；
-    int=固定索引（macOS 已验证索引，沿用旧实现）。"""
+    face_hint: None=单 face 文件；str=按 PS 名先精确后边界子串选 face；
+    int=固定索引（pick_face 保留的遗留能力，当前平台源表已不用）。"""
     if SYSTEM == "darwin":
         return _macos_sources()
     if SYSTEM == "windows":
@@ -117,10 +118,15 @@ def _macos_sources():
     fdir = "/System/Library/Fonts"
     sup = os.path.join(fdir, "Supplemental")
     return {
-        "sans-reg": [(os.path.join(fdir, "Hiragino Sans GB.ttc"), 0)],
-        "sans-bold": [(os.path.join(fdir, "Hiragino Sans GB.ttc"), 2)],
-        "serif-reg": [(os.path.join(sup, "Songti.ttc"), 6)],
-        "serif-bold": [(os.path.join(sup, "Songti.ttc"), 1)],
+        # PS 名精确匹配选 face（review 004 fix: 原硬编码索引 0/2/6/1 在系统
+        # 升级改变 TTC face 顺序时会静默选错字体；PS 名稳定且 pick_face
+        # 先精确匹配，未命中才回退 face 0 并警告）
+        "sans-reg": [(os.path.join(fdir, "Hiragino Sans GB.ttc"), "HiraginoSansGB-W3")],
+        "sans-bold": [
+            (os.path.join(fdir, "Hiragino Sans GB.ttc"), "HiraginoSansGB-W6")
+        ],
+        "serif-reg": [(os.path.join(sup, "Songti.ttc"), "STSongti-SC-Regular")],
+        "serif-bold": [(os.path.join(sup, "Songti.ttc"), "STSongti-SC-Bold")],
         "times-reg": [(os.path.join(sup, "Times New Roman.ttf"), None)],
         "times-bold": [(os.path.join(sup, "Times New Roman Bold.ttf"), None)],
     }
@@ -231,6 +237,15 @@ def rename_ps_name(font):
 _download_cache = {}
 
 
+def _cleanup_downloads():
+    """进程退出时清理下载临时文件（review 004 fix: mkstemp 文件 /tmp 泄漏）"""
+    for tmp in _download_cache.values():
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def download(url):
     """下载到临时文件（URL 级缓存），失败返回 None"""
     if url in _download_cache:
@@ -285,6 +300,7 @@ def extract_and_save(src_path, hint, out_path):
 
 
 def main():
+    atexit.register(_cleanup_downloads)  # 下载临时文件进程退出即清理
     # Windows 上 stdout 重定向（管道/CI 日志）时用 locale 编码会中文乱码/报错
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)

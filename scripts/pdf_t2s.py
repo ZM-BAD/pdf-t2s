@@ -25,6 +25,7 @@
 import argparse
 import multiprocessing as mp
 import os
+import re
 import sys
 import tempfile
 import time
@@ -53,6 +54,15 @@ LATIN_SERIF = {
     16: os.path.join(BASE, "t2s-times-bold.ttf"),
 }
 BOLD_FLAG = 16
+# FontDescriptor /Flags 斜体位（PDF spec bit 5 = 32）。
+# 假斜体保真（004 fix）: 原 PDF 常用"正体字体文件 + 描述符斜体位"表达斜体，
+# 重绘后必须把该位补到新字体对象，否则 Chrome/Foxit 等理会标志的查看器
+# 中原文斜体、输出正体。
+ITALIC_FLAG = 32
+# MuPDF rawdict span 字体名截断长度（实测: 超长名截到 24 字符，
+# 如 TimesNewRomanPS-BoldItalicMT → TimesNewRomanPS-BoldItal）。
+# 截断导致 ZO 复用查键失败 → 真斜体回退正体，必须前缀回退。
+SPAN_FONT_NAME_MAX = 24
 # 可子集化的系统字体路径集（原 PDF 内嵌字体 ZO 不在此列，保持完整嵌入）
 SYSTEM_FONT_PATHS = set(CJK_FONTS.values()) | set(LATIN_SERIF.values())
 # 已加载的系统字体槽位: {fonts 字典键: 路径}，由 load_fonts 填充。
@@ -109,6 +119,21 @@ def int2rgb(c):
     return ((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255
 
 
+# 名字级粗体检测补充（004 fix）: MuPDF 的 span 粗体位只认 'Bold' 字样，
+# 'Xbold'/'Heavy'/'Black' 等加粗档位不设位（MHeiHK-Xbold、SourceHanSansCN-
+# Heavy 实测），导致这些粗体回退常规字重。名字含这些档位词视为粗体。
+# 注意: 返回值必须是 0/16 整数（fallback_font 用它拼接资源名 ZS0/ZS16 并
+# 索引槽位键）——布尔值会产出 ZSTrue/ZSFalse 且查不到粗体槽位。
+BOLD_NAME_RE = re.compile(r"(?:X?Bold|Heavy|Black)", re.IGNORECASE)
+
+
+def _span_bold(flags, fontname):
+    bold = flags & BOLD_FLAG
+    if not bold and BOLD_NAME_RE.search(fontname):
+        bold = BOLD_FLAG
+    return bold
+
+
 def collect_rows(page):
     """按视觉行返回 [(line_y0, [span...])]，span=(bbox, origin, text, size, color, fontname, bold, chars)
     chars: 竖排时逐字符 (char, origin) 列表；横排为 None"""
@@ -138,7 +163,7 @@ def collect_rows(page):
                         s["size"],
                         s["color"],
                         s["font"],
-                        s["flags"] & BOLD_FLAG,
+                        _span_bold(s["flags"], s["font"]),
                         chars,
                     )
                 )
@@ -153,6 +178,21 @@ def font_key(name):
     get_fonts(full=True) 的 basefont 带前缀，rawdict span 字体名不带，
     统一去前缀后匹配。"""
     return name.split("+")[-1]
+
+
+def find_doc_font(doc_fonts, fname):
+    """span 字体名 -> doc_fonts 键。MuPDF 提取时把超长字体名截断到
+    SPAN_FONT_NAME_MAX 字符（如 TimesNewRomanPS-BoldItalicMT →
+    TimesNewRomanPS-BoldItal），精确匹配失败时按截断前缀回退完整名，
+    否则真斜体等长名字体回退成正体系统字体。"""
+    key = font_key(fname)
+    if key in doc_fonts:
+        return key
+    if len(key) == SPAN_FONT_NAME_MAX:
+        for k in doc_fonts:
+            if k.startswith(key):
+                return k
+    return None
 
 
 _glyph_cache = {}
@@ -201,8 +241,11 @@ def load_doc_fonts(doc):
 
 
 def original_font(fname, doc_fonts):
-    """原字体 -> (资源名, 文件路径)"""
-    return doc_fonts[font_key(fname)][2], doc_fonts[font_key(fname)][1]
+    """原字体 -> (资源名, 文件路径)（含截断名前缀回退，见 find_doc_font）"""
+    key = find_doc_font(doc_fonts, fname)
+    if key is None:
+        raise KeyError(fname)
+    return doc_fonts[key][2], doc_fonts[key][1]
 
 
 def fallback_font(fonts, fname, bold, new, has_cjk):
@@ -210,7 +253,11 @@ def fallback_font(fonts, fname, bold, new, has_cjk):
     `new` 全部字符的已加载字体（无命中用首选）。原字体不可提取/不可映射的
     未转换 span，以及转换过的 span，都经此选择——保证字形可渲染、提取不丢。
     跨平台降级（004）: 只从 _LOADED_PATHS 中的槽位选择——粗体槽位缺失时
-    降级同族常规（bold→0），整族缺失时降级另一族；全部缺失给出明确错误。"""
+    降级同族常规（bold→0），整族缺失时降级另一族；全部缺失给出明确错误。
+    bold 必须是 0/16 整数（资源名拼接与槽位索引依赖；布尔 True 曾产出
+    ZSTrue 资源名且查不到粗体槽位，见 _span_bold）。"""
+    if bold not in (0, BOLD_FLAG):
+        raise ValueError(f"bold 必须为 0 或 {BOLD_FLAG}，实际: {bold!r}")
     kind = font_kind(fname)
     other = "sans" if kind == "serif" else "serif"
     # 候选顺序（保持与原版一致 + 降级追加项）: 每个族内 粗体→常规（bold 为 0 时
@@ -278,11 +325,11 @@ def pick_font(fonts, doc_fonts, fname, bold, orig_text, new_text):
         rn, fp, meas = fallback_font(
             fonts, fname, bold, new_text, any(is_cjk(c) for c in new_text)
         )
-    elif font_key(fname) in doc_fonts and all(
-        can_map(doc_fonts[font_key(fname)][0], c) for c in new_text
+    elif (key := find_doc_font(doc_fonts, fname)) is not None and all(
+        can_map(doc_fonts[key][0], c) for c in new_text
     ):
         rn, fp = original_font(fname, doc_fonts)
-        meas = doc_fonts[font_key(fname)][0]
+        meas = doc_fonts[key][0]
     else:
         rn, fp, meas = fallback_font(
             fonts, fname, bold, new_text, any(is_cjk(c) for c in new_text)
@@ -311,11 +358,69 @@ def collect_needed_chars(doc, cc, fonts, doc_fonts_all):
     return needed
 
 
+def _render_ink(fontfile, text):
+    """MuPDF 渲染文本并返回墨迹像素数（冒烟测试用）"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    sh = fitz.Shape(pg)
+    sh.insert_text((10, 30), text, fontname="T", fontfile=fontfile, fontsize=10)
+    sh.commit()
+    pix = pg.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+    n = pix.n
+    s = pix.samples
+    ink = sum(1 for i in range(0, len(s), n) if sum(s[i : i + 3]) / 3 < 128)
+    doc.close()
+    return ink
+
+
+_FULL_CMAP_CACHE = {}
+
+
+def _subset_smoke_test(subset_path, full_path, chars):
+    """子集有效性双检（004 fix，补 review 发现的两个静默失败形态）:
+    1. cmap 覆盖: 全字体含有的请求字符必须全部可映射——默认子集化 Hiragino 时
+       cmap 会被截断到 ~68 条（字形全保留但映射丢失），真实字符画成 notdef。
+       原 PDF 提取乱码字符（如 JhengHei ETen-B5 的 '⸒' 等，全字体本就没有）
+       不参与检查——它们画成 notdef 是原文档固有乱码，不是子集缺陷
+    2. 渲染冒烟: 抽样绘制墨迹须达完整字体的 50%——GID 重编号破坏 charstring
+       引用时子集"提取正常但渲染全空"，仅小样本冒烟会被低位码点幸存条目骗过
+       （排序采样恰好全命中幸存条目）。"""
+    try:
+        if full_path not in _FULL_CMAP_CACHE:
+            _FULL_CMAP_CACHE[full_path] = TTFont(full_path).getBestCmap()
+        usable = [c for c in chars if ord(c) in _FULL_CMAP_CACHE[full_path]]
+        if not usable:
+            return False
+        sub_cmap = TTFont(subset_path).getBestCmap()
+        if any(ord(c) not in sub_cmap for c in usable):
+            return False
+        sample = "".join(sorted(usable))[:40]  # 40 字 × 10pt 在页宽内
+        ink_full = _render_ink(full_path, sample)
+        ink_sub = _render_ink(subset_path, sample)
+        return ink_sub > 0 and ink_sub >= ink_full * 0.5
+    except Exception:  # noqa: BLE001 — 冒烟测试失败按坏子集处理
+        return False
+
+
+def _subset_once(fp, chars, out, retain_gids):
+    """fontTools 子集化单次尝试（retain_gids 区分）"""
+    font = TTFont(fp)
+    ss = Subsetter(options=Options(retain_gids=retain_gids))
+    ss.unicodes_requested = {ord(c) for c in chars}
+    ss.subset(font)
+    font.save(out)
+
+
 def subset_system_fonts(needed):
     """阶段 2: 仅子集化系统字体（SYSTEM_FONT_PATHS），输出到 SUBSET_DIR。
-    子集化失败（异常字体）回退完整字体，不中断转换。返回 {原路径: 子集路径}。
+    子集化失败（异常字体或字形为空）回退完整字体，不中断转换。
+    返回 {原路径: 子集路径}。
     用 unicodes_requested（fontTools 4.63 API）保证字符覆盖；子集化保留
-    ZT2S- 前缀 PS 名（MuPDF 嵌入时资源命名依赖它防撞名）。"""
+    ZT2S- 前缀 PS 名（MuPDF 嵌入时资源命名依赖它防撞名）。
+    004 fix: 默认 GID 重编号破坏 Hiragino CID-CFF 的 charstring 引用（子集
+    "成功"但渲染全空，封面/目录/粗体静默消失）——先按默认子集化并渲染冒烟，
+    失败再用 retain_gids 重试（保留 GID 不破坏引用，代价是体积略大，如
+    Tinos 136KB vs 17KB——故只对冒烟失败的字体启用）。"""
     os.makedirs(SUBSET_DIR, exist_ok=True)
     mapping = {}
     for fp, chars in needed.items():
@@ -323,12 +428,13 @@ def subset_system_fonts(needed):
             continue
         out = os.path.join(SUBSET_DIR, os.path.basename(fp))
         try:
-            font = TTFont(fp)
-            ss = Subsetter(options=Options())
-            ss.unicodes_requested = {ord(c) for c in chars}
-            ss.subset(font)
-            font.save(out)
-            mapping[fp] = out
+            _subset_once(fp, chars, out, retain_gids=False)
+            if _subset_smoke_test(out, fp, chars):
+                mapping[fp] = out
+                continue
+            _subset_once(fp, chars, out, retain_gids=True)
+            if _subset_smoke_test(out, fp, chars):
+                mapping[fp] = out
         except Exception:  # noqa: BLE001, S112 — 子集化失败回退完整字体，不中断转换
             continue
     return mapping
@@ -419,6 +525,59 @@ def collect_blank_bboxes(page):
     return out
 
 
+def _descriptor_target(doc, xref):
+    """字体对象的 FontDescriptor 位置: ('xref', fdx) 或直接字典路径
+    ('path', 'FontDescriptor/Flags' 类路径)。Type0/CID 字体的描述符在
+    DescendantFonts[0] 内（insert_text 嵌入的 TTF 即此结构）。无则 (None, None)"""
+    t, v = doc.xref_get_key(xref, "FontDescriptor")
+    if t == "xref":
+        return "xref", int(v.split()[0])
+    if t == "dict":
+        return "path", "FontDescriptor/Flags"
+    t2, v2 = doc.xref_get_key(xref, "DescendantFonts")
+    if t2 == "array":
+        first = v2.strip("[]").split()[0]  # 首个 DescendantFont 引用
+        t3, v3 = doc.xref_get_key(int(first), "FontDescriptor")
+        if t3 == "xref":
+            return "xref", int(v3.split()[0])
+        if t3 == "dict":
+            return "path", "DescendantFonts/0/FontDescriptor/Flags"
+    return None, None
+
+
+def _descriptor_flags(doc, xref):
+    """字体对象的 FontDescriptor /Flags；无描述符/取值异常返回 None"""
+    kind, target = _descriptor_target(doc, xref)
+    if kind == "xref":
+        t, v = doc.xref_get_key(target, "Flags")
+        return int(v) if t == "int" else None
+    if kind == "path":
+        t, v = doc.xref_get_key(xref, target)
+        return int(v) if t == "int" else None
+    return None
+
+
+def apply_italic_flags(page, italic_rns):
+    """假斜体保真（004 fix）: 把原字体的 FontDescriptor 斜体位补到重绘创建的
+    新字体对象上。原 PDF 的斜体常靠描述符斜体位表达（字体文件本身正体），
+    insert_text 生成的新字体对象不带该位，Chrome/Foxit 等理会标志的查看器
+    中斜体会消失。"""
+    if not italic_rns:
+        return
+    doc = page.parent
+    for xref, _ext, _ftype, _bf, rn, _enc, _fl in page.get_fonts(full=True):
+        if rn not in italic_rns:
+            continue
+        kind, target = _descriptor_target(doc, xref)
+        if kind is None:
+            continue  # 无描述符（base-14 标准字体等）：无从设置
+        cur = _descriptor_flags(doc, xref) or 0
+        if kind == "xref":
+            doc.xref_set_key(target, "Flags", str(cur | ITALIC_FLAG))
+        else:
+            doc.xref_set_key(xref, target, str(cur | ITALIC_FLAG))
+
+
 def rebuild_page(page, cc, fonts, doc_fonts, font_path_map=None):
     """逐页重绘。font_path_map: 系统字体 {原路径: 子集路径}（v1.1），
     insert_text 的 fontfile 经映射替换；测量仍用完整字体（度量一致）。"""
@@ -426,6 +585,15 @@ def rebuild_page(page, cc, fonts, doc_fonts, font_path_map=None):
     rows = collect_rows(page)
     if not rows:
         return 0
+    # 页字体斜体标志（redaction 前读取原字体描述符；键与 doc_fonts 一致，
+    # 超长名经 find_doc_font 前缀回退）
+    italic_map = {}
+    for xref, _ext, _ftype, basefont, _rn, _enc, _fl in page.get_fonts(full=True):
+        key = font_key(basefont)
+        flags = _descriptor_flags(page.parent, xref) or 0
+        if flags & ITALIC_FLAG:
+            italic_map[key] = True
+    italic_rns = set()
     # 1) 删除全部旧文本（图片/矢量线保留）——含纯空白 span（v1.1: 清字体残留引用）
     for _, spans in rows:
         for bbox, *_ in spans:
@@ -451,6 +619,8 @@ def rebuild_page(page, cc, fonts, doc_fonts, font_path_map=None):
                     if ch_new != ch:
                         changed += 1
                     rn, fp, _ = pick_font(fonts, doc_fonts, fname, bold, ch, ch_new)
+                    if find_doc_font(italic_map, fname) is not None:
+                        italic_rns.add(rn)
                     shape.insert_text(
                         ch_origin,
                         ch_new,
@@ -461,10 +631,20 @@ def rebuild_page(page, cc, fonts, doc_fonts, font_path_map=None):
                     )
             else:
                 rn, fp, meas = pick_font(fonts, doc_fonts, fname, bold, text, new)
-                # 宽度收缩: 以实际绘制字体度量（未转换 span 用原字体度量一致，不触发）
-                fit_w = meas.text_length(new, fontsize=size)
-                if fit_w > bbox.width * 1.02 and fit_w > 0:
-                    size = max(size * bbox.width / fit_w, size * 0.6)
+                if find_doc_font(italic_map, fname) is not None:
+                    italic_rns.add(rn)
+                # 宽度拟合（004 fix）: 仅系统字体路径（ZO 原字体度量与原始一致，
+                # 跳过——MSungHK 等字形墨迹 1.107em 而 advance 1.0em，复用原字体
+                # 时重绘即还原，拟合反而错缩放）。以实际绘制字体度量:
+                #  收缩: 回退字体更宽 → 防溢出（原有逻辑）
+                #  放大: 回退字体更窄（Songti 1.0em vs MSungHK 1.107em）→ 补足
+                #  视觉宽度，否则行尾缩短、字距视觉变紧
+                if not rn.startswith("ZO"):
+                    fit_w = meas.text_length(new, fontsize=size)
+                    if fit_w > bbox.width * 1.02 and fit_w > 0:
+                        size = max(size * bbox.width / fit_w, size * 0.6)
+                    elif fit_w > 0 and fit_w < bbox.width * 0.98:
+                        size = min(size * bbox.width / fit_w, size * 1.5)
                 shape.insert_text(
                     origin,
                     new,
@@ -474,6 +654,7 @@ def rebuild_page(page, cc, fonts, doc_fonts, font_path_map=None):
                     color=int2rgb(color),
                 )
         shape.commit()
+    apply_italic_flags(page, italic_rns)
     return changed
 
 
@@ -642,6 +823,9 @@ def process_pdf_parallel(src, cc, fonts, out=None, jobs=None):
     print(f"  可用原字体 {n_fonts} 个", flush=True)
     needed = collect_needed_chars(doc, cc, fonts, doc_fonts)
     font_path_map = subset_system_fonts(needed)
+    # 书签（003 fix）: insert_pdf 合并不拷贝 outline，必须在此捕获原文档
+    # 书签树，合并后 set_toc 重建（标题同时转简体）
+    toc = doc.get_toc()
     doc.close()
     if font_path_map:
         saved = sum(
@@ -679,6 +863,10 @@ def process_pdf_parallel(src, cc, fonts, out=None, jobs=None):
         print(f"  合并去重字体 {n_dedup} 处", flush=True)
     if n_purged:
         print(f"  清理未引用字体条目 {n_purged} 个", flush=True)
+    if toc:  # 书签: 原文档页序与合并产物一致，页码直接可用；标题转简体
+        merged.set_toc(
+            [[lvl, cc.convert(title).replace("於", "于"), pg] for lvl, title, pg in toc]
+        )
     if out is None:
         out = default_output(src)
     try:

@@ -106,6 +106,29 @@ class TestHelpers(unittest.TestCase):
             self.m.font_key("ZT2S-STSongti-SC-Regular"), "ZT2S-STSongti-SC-Regular"
         )
 
+    def test_find_doc_font_truncated(self):
+        # MuPDF rawdict 把超长字体名截断到 24 字符（TimesNewRomanPS-BoldItalicMT
+        # → TimesNewRomanPS-BoldItal），ZO 复用查找必须前缀回退，否则真斜体
+        # 字体回退成正体系统字体
+        doc_fonts = {"TimesNewRomanPS-BoldItalicMT": "e"}
+        self.assertEqual(
+            self.m.find_doc_font(doc_fonts, "TimesNewRomanPS-BoldItal"),
+            "TimesNewRomanPS-BoldItalicMT",
+        )
+        # 完整名精确匹配优先于前缀回退
+        self.assertEqual(
+            self.m.find_doc_font(doc_fonts, "TimesNewRomanPS-BoldItalicMT"),
+            "TimesNewRomanPS-BoldItalicMT",
+        )
+        # 无匹配（不足 24 字符或前缀不匹配）返回 None
+        self.assertIsNone(self.m.find_doc_font(doc_fonts, "Times-Roman"))
+        self.assertIsNone(self.m.find_doc_font(doc_fonts, "NoSuchFont-ABCDEFGHIJ"))
+        # subset 前缀照常归一后再截断回退
+        self.assertEqual(
+            self.m.find_doc_font(doc_fonts, "SPNAJD+TimesNewRomanPS-BoldItal"),
+            "TimesNewRomanPS-BoldItalicMT",
+        )
+
     def test_default_output(self):
         # 默认输出命名: 大小写不敏感 .pdf 后缀（Windows 文件系统），无后缀不吞名
         self.assertEqual(self.m.default_output("x.pdf"), "x_简体.pdf")
@@ -301,6 +324,25 @@ class TestHelpers(unittest.TestCase):
         )
         doc.close()
 
+    def test_bold_name_detection(self):
+        # 004 fix: MuPDF span 粗体位只认 'Bold'——'Xbold'/'Heavy'/'Black' 等
+        # 加粗档位不设位（MHeiHK-Xbold、SourceHanSansCN-Heavy 实测），
+        # 名字级补充检测，否则这些粗体回退常规字重
+        self.assertTrue(self.m.BOLD_NAME_RE.search("MHeiHK-Xbold"))
+        self.assertTrue(self.m.BOLD_NAME_RE.search("SourceHanSansCN-Heavy"))
+        self.assertTrue(self.m.BOLD_NAME_RE.search("FuturaStd-Heavy"))
+        self.assertTrue(self.m.BOLD_NAME_RE.search("MHeiHK-Bold"))
+        self.assertTrue(self.m.BOLD_NAME_RE.search("NotoSansCJK-Black"))
+        self.assertFalse(self.m.BOLD_NAME_RE.search("MSungHK-Light"))
+        self.assertFalse(self.m.BOLD_NAME_RE.search("TimesLTStd-Roman"))
+        self.assertFalse(self.m.BOLD_NAME_RE.search("MHeiHK-Medium"))
+        # _span_bold 必须返回 0/16 整数（资源名拼接 ZS0/ZS16 与槽位索引
+        # 依赖整数；布尔 True 会产出 ZSTrue/ZSFalse 且查不到粗体槽位）
+        self.assertEqual(self.m._span_bold(4, "SourceHanSansCN-Heavy"), 16)
+        self.assertEqual(self.m._span_bold(16, "SourceHanSansCN-Heavy"), 16)
+        self.assertEqual(self.m._span_bold(4, "MSungHK-Light"), 0)
+        self.assertEqual(self.m._span_bold(0, "MHeiHK-Bold"), 16)
+
     def test_collect_rows_roundtrip(self):
         import fitz
 
@@ -352,6 +394,124 @@ class TestHelpers(unittest.TestCase):
             fonts, doc_fonts, "TestOrigSerif", 0, "年", "年"
         )
         self.assertEqual((rn4, fp4), ("ZO0", renamed))
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_pick_font_truncated_name_reuse(self):
+        # MuPDF 截断 24 字符: span 字体名 TimesNewRomanPS-BoldItal 必须复用
+        # 完整名 TimesNewRomanPS-BoldItalicMT 的原字体（否则回退正体丢斜体）
+        import fitz
+        from fontTools.ttLib import TTFont
+
+        from scripts import pdf_t2s
+
+        renamed = os.path.join(tempfile.mkdtemp(), "orig.ttf")
+        f = TTFont(os.path.join(pdf_t2s.BASE, "t2s-serif-regular.ttf"))
+        for r in f["name"].names:
+            if r.nameID == 6:
+                r.string = "TimesNewRomanPS-BoldItalicMT"
+        f.save(renamed)
+
+        fonts = pdf_t2s.load_fonts()
+        doc_fonts = {
+            "TimesNewRomanPS-BoldItalicMT": (
+                fitz.Font(fontfile=renamed),
+                renamed,
+                "ZO0",
+                1,
+            )
+        }
+        # 未转换 span（rawdict 名被截断到 24 字符）→ 必须命中完整名复用 ZO
+        rn, fp, _ = pdf_t2s.pick_font(
+            fonts, doc_fonts, "TimesNewRomanPS-BoldItal", 0, "2B", "2B"
+        )
+        self.assertEqual((rn, fp), ("ZO0", renamed), "截断字体名未复用原字体")
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_italic_flag_preserved(self):
+        # 假斜体（FontDescriptor 斜体位）重绘后必须补到新字体对象，否则
+        # Chrome/Foxit 等理会标志的查看器中原文斜体、输出正体
+        import fitz
+        from fontTools.ttLib import TTFont
+
+        from scripts import pdf_t2s
+
+        renamed = os.path.join(tempfile.mkdtemp(), "orig.ttf")
+        f = TTFont(os.path.join(pdf_t2s.BASE, "t2s-serif-regular.ttf"))
+        for r in f["name"].names:
+            if r.nameID == 6:
+                r.string = "TestOrigSerif"
+        f.save(renamed)
+
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text(
+            (72, 72), "ABC2021", fontname="F0", fontfile=renamed, fontsize=12
+        )
+        xref = page.get_fonts(full=True)[0][0]
+        # insert_text 嵌入的 TTF 是 Type0/CID 结构，描述符在 DescendantFonts 内
+        df = int(doc.xref_get_key(xref, "DescendantFonts")[1].strip("[]").split()[0])
+        fdx = int(doc.xref_get_key(df, "FontDescriptor")[1].split()[0])
+        doc.xref_set_key(fdx, "Flags", "34")  # 斜体(32)+衬线(2): 假斜体
+        cc = __import__("opencc").OpenCC("t2s")
+        fonts = pdf_t2s.load_fonts()
+        doc_fonts = {
+            "TestOrigSerif": (fitz.Font(fontfile=renamed), renamed, "ZO0", xref)
+        }
+        pdf_t2s.rebuild_page(page, cc, fonts, doc_fonts)
+
+        zo_flags = []
+        for x, _e, _t, _bf, rn, _enc, _fl in page.get_fonts(full=True):
+            if rn == "ZO0":
+                # 与 pdf_t2s._descriptor_target 相同导航（Type0/CID）
+                df2 = int(
+                    doc.xref_get_key(x, "DescendantFonts")[1].strip("[]").split()[0]
+                )
+                fdx2 = int(doc.xref_get_key(df2, "FontDescriptor")[1].split()[0])
+                zo_flags.append(int(doc.xref_get_key(fdx2, "Flags")[1]))
+        self.assertTrue(zo_flags, "未找到重绘后的 ZO0 字体对象")
+        self.assertTrue(
+            all(fl & 32 for fl in zo_flags),
+            f"重绘字体未保留斜体位: Flags={zo_flags}",
+        )
+        doc.close()
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_subset_renderable(self):
+        # 004 fix: fontTools Subsetter 默认 GID 重编号会破坏 Hiragino 的
+        # CID-CFF 内部引用——子集"成功"但字形全空（渲染 0 墨迹），封面/目录/
+        # 粗体文字静默消失。retain_gids=True 保留 GID 后子集必须可渲染。
+        # 回归: 6 个槽位子集化后均须有墨迹（MuPDF 实测）。
+        import fitz
+
+        def render_ink(fontfile, text):
+            doc = fitz.open()
+            pg = doc.new_page()
+            sh = fitz.Shape(pg)
+            sh.insert_text(
+                (50, 100), text, fontname="F", fontfile=fontfile, fontsize=11
+            )
+            sh.commit()
+            pix = pg.get_pixmap(matrix=fitz.Matrix(1, 1))
+            n = pix.n
+            s = pix.samples
+            ink = sum(1 for i in range(0, len(s), n) if sum(s[i : i + 3]) / 3 < 128)
+            doc.close()
+            return ink
+
+        for fp in sorted(self.m.SYSTEM_FONT_PATHS):
+            # Times 槽位纯拉丁（真实管线只给纯拉丁 span 用 Times），CJK 槽位混排
+            chars = (
+                "ABCabcXYZ0123-./()"
+                if "times" in os.path.basename(fp)
+                else "预期时间表测试ABC123"
+            )
+            mapping = self.m.subset_system_fonts({fp: set(chars)})
+            self.assertIn(fp, mapping, f"{fp} 子集化失败")
+            ink = render_ink(mapping[fp], chars)
+            # 坏子集渲染为精确 0 墨迹；Times 纯拉丁槽位仅拉丁字形有墨迹，阈值放宽
+            self.assertGreater(
+                ink, 10, f"{os.path.basename(fp)} 子集字形为空（GID 重编号 bug）"
+            )
 
     @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
     def test_subset_system_fonts(self):
@@ -524,6 +684,43 @@ class TestHelpers(unittest.TestCase):
                 bad += 1
         d2.close()
         self.assertEqual(bad, 0, f"并行输出 {bad} 页文本异常")
+
+    @unittest.skipUnless(FONTS_READY, "需要 prepare_fonts.py 生成的 t2s-*.ttf")
+    def test_parallel_preserves_toc(self):
+        # 003 fix: insert_pdf 合并不拷贝 outline，并行路径必须手动 set_toc
+        # （书签标题同时转简体）
+        import fitz
+        import opencc
+
+        from scripts import pdf_t2s
+
+        serif = pdf_t2s.CJK_FONTS[("serif", 0)]
+        doc = fitz.open()
+        for _ in range(60):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 72), "繁體字測試2021年", fontname="F0", fontfile=serif, fontsize=12
+            )
+        toc = [[1, "封面", 1], [1, "重要提示", 2], [2, "第一節", 5], [1, "第二節", 30]]
+        doc.set_toc(toc)
+        src = os.path.join(tempfile.mkdtemp(), "par_toc.pdf")
+        doc.save(src)
+        doc.close()
+        cc = opencc.OpenCC("t2s")
+        fonts = pdf_t2s.load_fonts()
+        out = pdf_t2s.process_pdf_parallel(src, cc, fonts, jobs=2)
+        d2 = fitz.open(out)
+        d2_toc = d2.get_toc()
+        d2.close()
+        self.assertEqual(len(d2_toc), len(toc), f"并行输出丢失书签: {d2_toc}")
+        # 标题转简体（節→节），页码不变
+        expected = [
+            [1, "封面", 1],
+            [1, "重要提示", 2],
+            [2, "第一节", 5],
+            [1, "第二节", 30],
+        ]
+        self.assertEqual(d2_toc, expected, f"书签内容不符: {d2_toc}")
 
 
 if __name__ == "__main__":

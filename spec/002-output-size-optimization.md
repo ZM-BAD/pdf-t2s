@@ -21,6 +21,7 @@ date: 2026-08-16
 1. **提取 `pick_font()`**：横排/竖排统一的字体选择函数，字符收集与重绘两阶段复用，保证子集字符覆盖与实际绘制完全一致
 2. **阶段 1 字符收集 `collect_needed_chars()`**：全文档扫描 span → 转换 → `pick_font` → 按字体文件路径收集所需字符集（含竖排逐字符）
 3. **阶段 2 子集化 `subset_system_fonts()`**：仅对系统字体（CJK_FONTS/LATIN_SERIF 路径集）fontTools subset，输出到每进程独立临时目录（`tempfile.mkdtemp`，防并发转换互相覆盖）；子集化失败回退完整字体（转换照常完成）
+   - **004 fix（GID 重编号 bug）**：`Options(retain_gids=True)`——默认 GID 重编号破坏 Hiragino 的 CID-CFF charstring 引用，子集"成功"但字形全空（渲染 0 墨迹，封面/目录/粗体文字静默消失；`has_glyph`/提取均正常，仅渲染失效）。retain_gids 后 6 个槽位全部可渲染（Hiragino 子集 12MB→244KB）。`_subset_smoke_test` 渲染冒烟兜底其他静默损坏（失败回退完整字体）
 4. **阶段 3 重绘**：`rebuild_page` 以子集路径替换 fontfile（`font_path_map.get(fp, fp)`），测量仍用完整字体（hmtx 度量一致，收缩行为不变）
 5. ZO 原字体**不子集化**（已是子集且为 CID CFF 风险高，体积占比小）
 6. **死字体清理 `purge_unused_fonts()`**：redaction 后个别字体对象残留且被页面/Form 的 Resources 持有引用——保存前删除 Resources/Font 中内容流未引用的条目；扫描范围含页面内容流与全部 Form XObject 内容流（防误删 Form 引用的字体）；兼容 Resources/Font 直接字典与间接引用结构，资源名正则含下划线（防把 `C0_0` 误判为 `C0`）

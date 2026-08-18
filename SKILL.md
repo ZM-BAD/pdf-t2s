@@ -113,6 +113,11 @@ python3 -m venv .venv                                    # Windows: py -m venv .
 | 23 | 并发转换竞争 | 固定 `/tmp` 子集/原字体目录会被并发转换互相覆盖 → rebuild 读到别的文档的子集 → 大范围 notdef/`\x00`（症状：常用字变 `\x00`、嵌入流却含字形）。修复：`tempfile.mkdtemp` 每进程独立目录 |
 | 24 | 死字体回收 | redaction 后原字体残留于页面/Form 的 Resources，`garbage=3` 不回收（智谱实测 10.1MB）→ `purge_unused_fonts()` 保存前清理；需兼容 Resources/Font 直接字典与间接引用两种结构，资源名正则要含下划线 |
 | 25 | Windows 无宋体粗体 | simsun.ttc 只有 SimSun/NSimSun 两个常规 face → prepare_fonts 自动下载 Noto Serif CJK SC Bold 补位；离线时粗体槽位降级复用常规宋体（粗体 span 视觉变细，不影响正确性）。另：任何平台字体文件缺失时 `load_fonts()` 跳过并警告，`fallback_font` 只在已加载槽位中选（bold→常规、整族→另一族降级），全缺时报清晰错误 |
+| 26 | 并行合并丢书签 | `insert_pdf` 只拷贝页面、不拷贝 outline（书签树在 catalog /Outlines）→ ≥50 页并行产物书签全丢（智谱 35 条 → 0）。修复：合并前 `doc.get_toc()` 捕获，合并后 `merged.set_toc()` 重建（页序一致页码直接可用，标题 t2s 转简体）；verify.py 书签维度回归门禁 |
+| 27 | 字体名 24 字符截断 | MuPDF rawdict 把超长 span 字体名截到 24 字符（`TimesNewRomanPS-BoldItalicMT` → `TimesNewRomanPS-BoldItal`），ZO 复用查键失败 → 真斜体回退正体系统字体（MiniMax p159 '2B'/'2C' 实测斜体丢失）。修复：`find_doc_font` 精确匹配失败按 24 字符前缀回退完整名 |
+| 28 | 假斜体标志丢失 | 原 PDF 的斜体常靠"正体字体文件 + FontDescriptor 斜体位(bit5=32)"表达（如 Times-Roman ×1411 全带斜体位，文件本身正体）；`insert_text` 新字体对象不带该位 → Chrome/Foxit/Acrobat 等理会标志的查看器中斜体消失（MuPDF/Quartz 渲染忽略该位，此类查看器无感）。修复：`apply_italic_flags` 按页把原字体描述符斜体位补到重绘新字体对象（支持简单字体直链与 Type0/CID DescendantFonts 内嵌） |
+| 29 | 子集化静默产出空字形 | fontTools Subsetter 默认 GID 重编号破坏 Hiragino 的 CID-CFF charstring 引用——子集"成功"（提取正常、has_glyph 正常）但字形全空，渲染 0 墨迹 → 封面/目录/粗体文字静默消失（verify 像素密度阈值抓不到小面积缺失）。修复：默认子集化 + `_subset_smoke_test` 双检（cmap 全覆盖 + 渲染墨迹 ≥ 完整字体 50%）——失败才用 `retain_gids=True` 重试（保留 GID 不破坏引用，代价是体积略大，如 Tinos 136KB vs 17KB，故只对冒烟失败的字体启用）。双检必须: ①cmap 检查要剔除全字体本就没有的字符（原 PDF 提取乱码如 JhengHei '⸒'，否则误判回退全字体）②渲染抽样要排除乱码字符且与完整字体对比（排序采样恰好命中幸存条目会骗过单纯 ink>0 冒烟） |
+| 30 | Xbold/Heavy 粗体丢失 | MuPDF span 粗体位只认 'Bold' 字样——'Xbold'/'Heavy'/'Black' 加粗档位不设位（MHeiHK-Xbold、SourceHanSansCN-Heavy 实测），粗体 span 回退常规字重。修复：`_span_bold` 名字级补充检测（X?Bold/Heavy/Black），返回值必须是 0/16 整数（布尔 True 会产出 ZSTrue/ZSFalse 资源名且查不到粗体槽位） |
 
 ## 验证门槛（必须跑 verify.py，不验证不算完成）
 
@@ -124,6 +129,7 @@ python3 -m venv .venv                                    # Windows: py -m venv .
 4. **像素级**：1.0x 渲染暗像素密度对比（均匀抽样 + 全部竖排页 + 收缩页，阈值 0.02）。
 5. **竖排**：竖排列字符位置逐点核对——0 缺失。
 6. **繁体残留**：仅简繁字形不同的特征字串（TRAD）计数，必须为 0。
+7. **书签**：输出书签与原文档一致（标题按 t2s 转换后比对，页码一致）——并行合并丢书签的回归门禁。
 
 验收判定由 verify.py 末尾输出（✅/❌）。
 
@@ -136,9 +142,12 @@ python3 -m venv .venv                                    # Windows: py -m venv .
 
 - **标点 unicode 变体**：`-`→软连字符、`•`→`・`、`…`→`⋯`（字体 ToUnicode 一对多映射，页面显示一样，复制得到变体字符，无法根治）。
 - **字体风格**：转换过的 span 及原字体不可映射的 span（CID CFF 无 Unicode cmap）存在字形替换（原始细宋体→标准宋体，笔画略粗，墨迹可增 30%~135%）；未转换 span 复用原字体（TrueType 类），无此问题。
+- **斜体**：真斜体字体（字形本身倾斜）经 ZO 复用保留；"假斜体"（正体字体文件 + FontDescriptor 斜体位）的斜体位已保真到输出（坑 28），Chrome/Foxit/Acrobat 等理会标志的查看器中原样倾斜；MuPDF/Quartz 系查看器两版均渲染正体。
 - **Windows 宋体粗体**：simsun.ttc 无粗体 face，`prepare_fonts.py` 自动下载 Noto Serif CJK SC Bold（OFL）补位；离线/`--no-download` 时粗体降级为常规宋体（视觉变细，不影响正确性）。
 - **横向拉伸丢失**：原始约 2% 的 span 使用非等比横向拉伸（text matrix 1.28× 等，常见于页眉），`insert_text` 不支持非等比缩放，重绘后字距归为正常 em（该行文字变窄约 20%，位置不漂移）。
 - **提取顺序**：个别竖排/表格密集页与原始内容流顺序不同（重建后更符合阅读顺序）。
+- **不可提取文字**：原 PDF 中 ToUnicode 缺失的文字（如部分竖排列）MuPDF 提取不到，若其字形与可提取 span 的 redact 矩形重叠会被误删（MiniMax 部分页面左/右边缘竖排列实测丢失；verify 网格维度以 min_ink=250 排除此类小面积既有损失，回归级大损失仍会被检出）。
+- **竖排列位置**：竖排文字逐字符重绘，回退字体度量差异可致列位置 ~10pt 偏移（页 229 实测）。
 - **文件体积**：v1.1 起系统字体预子集化 + ZO 原字体完整嵌入，输出约 12-18MB（v1.0 为 ~60MB）；ZO 原字体不子集化是为保证字形保真。
 
 ## 参考

@@ -45,7 +45,7 @@ date: 2026-08-17
 1. `scripts/pdf_t2s.py` 新增 `process_pdf_parallel(src, cc, fonts, out, jobs)` 三阶段流水线：
    - **阶段 1（串行）**：`load_doc_fonts` + `collect_needed_chars`（全文档字符集是子集化的前提，必须全局一次）+ `subset_system_fonts` → 子集映射表写临时文件供子进程读取
    - **阶段 2（并行）**：`multiprocessing.Pool(jobs)` 分块执行 `_block_worker`——每进程独立打开原 PDF、`load_doc_fonts`、块内逐页 `rebuild_page`（复用同一 `pick_font`/子集路径）、`doc.select(块内页)` 裁剪、保存块文件（garbage=3）
-   - **阶段 3（串行）**：`insert_pdf` 逐块合并（annots/links=False）→ `dedup_fonts` 手动去重 → `purge_unused_fonts` → `doc.save(out, garbage=3, deflate=True, deflate_fonts=True)`
+   - **阶段 3（串行）**：`insert_pdf` 逐块合并（annots/links=False）→ `dedup_fonts` 手动去重 → `purge_unused_fonts` → **书签重建（004 fix）** → `doc.save(out, garbage=3, deflate=True, deflate_fonts=True)`
 2. **降级规则**：页数 < 50 或 jobs=1 → 走现有串行 `process_pdf`（避免分块固定开销，小文档串行更快）
 3. **CLI**：`main()` 默认自动并行（`jobs = min(cpu_count, 页数)`，页数 < 50 自动降级串行）；`--jobs N` 显式覆盖（1 = 强制串行）
 4. **失败处理**：任一块失败 → 整体报错退出（非零），临时块文件/子集目录由 `tempfile` 清理（mkdtemp 每进程独立已保证）
@@ -59,6 +59,7 @@ date: 2026-08-17
 - **worker 必须模块级可 pickle**（macOS spawn 模式）；worker 内 `load_fonts`（~0.1s）与 `load_doc_fonts`（~0.7s）每块一次，可接受
 - **块输出体积**：每块 ~63 页 ≈ 1-2MB（含该块用到的字体子集）
 - **合并去重**：`insert_pdf` 合并后各块的相同字体（同 PS 名同内容）以不同 xref 存在；`dedup_fonts` 按 PS 名+流哈希统一 xref（O(n)，`garbage=4` 的流合并是 O(n²) 实测 45s+，哈希去重 <1s）
+- **书签重建（004 fix）**：`insert_pdf` 只拷贝页面，不拷贝文档级 outline（书签树在 catalog 的 /Outlines）——并行产物书签全丢（智谱 35 条 / MiniMax 34 条 → 0）。阶段 1 在 `doc.close()` 前捕获 `doc.get_toc()`，合并后 `merged.set_toc(...)` 重建（合并页序与原文档一致，页码直接可用；标题按 t2s 转换：`cc.convert(title).replace("於","于")`）。verify.py 增加书签维度做回归门禁（标题转换后比对 + 页码一致）
 
 ## 验收标准
 

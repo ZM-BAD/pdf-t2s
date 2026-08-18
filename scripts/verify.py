@@ -63,6 +63,15 @@ def whitelisted_diff(miss, extra, cc):
 PIXEL_THRESHOLD = 0.02
 ORDER_THRESHOLD = 0.99
 FONT_REUSE_TARGET = 0.99  # 原字体可提取的未转换 span 复用率目标
+# 网格级像素检查（004 fix）: 整页密度对局部文字缺失不敏感（子集空字形曾致
+# 封面/目录文字整段消失而密度差仅 ~1%），12×10 格子中 原墨迹>GRID_MIN_INK
+# 且损失>GRID_LOSS_THRESHOLD 判定异常。阈值校准: 对两份验收文档 0 误报——
+# 既有的不可提取文字丢失与竖排重绘偏移（原 PDF ToUnicode 缺失/竖排字形度量
+# 差异，见 SKILL.md 已知限制）为 41-238px 小格子，min_ink=250 排除；
+# 回归级损失（子集空字形等整段消失）为数百至数千 px 的大格子，必被检出
+# （模拟坏封面 3 格检出）。
+GRID_MIN_INK = 250
+GRID_LOSS_THRESHOLD = 0.75
 
 
 def norm(s):
@@ -81,6 +90,24 @@ def ink_density(pixmap):
         if 0.299 * r + 0.587 * g + 0.114 * b < 128:
             dark += 1
     return dark / (total / 7 + 1)
+
+
+def ink_region(pixmap, c0, r0, c1, r1):
+    """网格区域内暗像素数（网格级像素检查用）"""
+    samples = pixmap.samples
+    n = pixmap.n
+    w = pixmap.width
+    dark = 0
+    for y in range(r0, r1):
+        base = (y * w + c0) * n
+        for x in range(c0, c1):
+            i = base + (x - c0) * n
+            if (
+                0.299 * samples[i] + 0.587 * samples[i + 1] + 0.114 * samples[i + 2]
+                < 128
+            ):
+                dark += 1
+    return dark
 
 
 def doc_fonts_map(doc):
@@ -298,8 +325,44 @@ def check_pair(src, dst):
         f"-> {pix_bad if pix_bad else ''}",
         flush=True,
     )
+    # 网格级（004 fix）: 整页密度阈值对局部文字缺失不敏感（子集空字形曾致
+    # 封面/目录整段文字消失而密度差仅 ~1%），按 12×10 格子比较局部墨迹——
+    # 原格子墨迹 >40 且损失 >60% 判定异常。用整页渲染（clip 渲染在带页内
+    # 变换的页面上坐标映射错误，不可用）。
+    grid_bad = []
+    for pno in sorted(sample):
+        pix1 = d1[pno].get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+        pix2 = d2[pno].get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+        for gx in range(12):
+            for gy in range(10):
+                c0 = gx * pix1.width // 12
+                c1 = (gx + 1) * pix1.width // 12
+                r0 = gy * pix1.height // 10
+                r1 = (gy + 1) * pix1.height // 10
+                a = ink_region(pix1, c0, r0, c1, r1)
+                b = ink_region(pix2, c0, r0, c1, r1)
+                if a > GRID_MIN_INK and (a - b) / a > GRID_LOSS_THRESHOLD:
+                    grid_bad.append((pno, gx, gy, a, b))
+    print(
+        f"网格级: {len(grid_bad)} 个格子墨迹损失异常 "
+        f"-> {grid_bad[:8] if grid_bad else ''}",
+        flush=True,
+    )
     print(
         f"输出: {os.path.basename(dst)} {os.path.getsize(dst) / 1024 / 1024:.1f}MB",
+        flush=True,
+    )
+
+    # 书签（004 fix 回归门禁）: 并行合并 insert_pdf 不拷贝 outline，输出书签
+    # 须与原文档一致（标题按 t2s 转换后比对，页码不变）
+    src_toc = [
+        [l, norm(cc.convert(t).replace("於", "于")), p] for l, t, p in d1.get_toc()
+    ]
+    dst_toc = [[l, norm(t), p] for l, t, p in d2.get_toc()]
+    toc_ok = src_toc == dst_toc
+    print(
+        f"书签: 原 {len(src_toc)} 条 -> 输出 {len(dst_toc)} 条 "
+        f"{'✅' if toc_ok else '❌ 不一致'}",
         flush=True,
     )
 
@@ -309,13 +372,16 @@ def check_pair(src, dst):
         and trad_left == 0
         and ff["rate"] >= FONT_REUSE_TARGET
         and not pix_bad
+        and not grid_bad
         and v_missing == 0
+        and toc_ok
     )
     print(
         f"验收: {'✅ 通过' if ok else '❌ 未通过'} "
         f"(非白名单差异 {len(not_white)} + 繁体残留 {trad_left} + "
         f"复用率 {ff['rate'] * 100:.1f}%(≥{FONT_REUSE_TARGET * 100:.0f}%) + "
-        f"像素异常 {len(pix_bad)} + 竖排缺失 {v_missing})",
+        f"像素异常 {len(pix_bad)} + 网格异常 {len(grid_bad)} + "
+        f"竖排缺失 {v_missing} + 书签 {'✅' if toc_ok else '❌'})",
         flush=True,
     )
 
